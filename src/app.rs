@@ -591,7 +591,6 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            KeyCode::Char('j') if ctrl => self.input.insert_char('\n'),
             KeyCode::Char('u') if ctrl => self.input.kill_to_line_start(),
             KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
             KeyCode::Char('a') if ctrl => self.input.home(),
@@ -954,7 +953,7 @@ impl App {
                      Type / to open the command menu {sep} {arrows} select, Enter complete, Esc dismiss\n\
                      \n\
                      Keys\n\
-                     Enter send {sep} \\ then Enter, Alt+Enter or Ctrl+J: new line\n\
+                     Enter send {sep} \\ then Enter, Alt+Enter or Shift+Enter: new line\n\
                      Esc / Ctrl+C interrupt {sep} Ctrl+C twice or Ctrl+D quit\n\
                      {arrows} prompt history {sep} PgUp/PgDn / mouse wheel scroll\n\
                      Ctrl+End jump to latest message\n\

@@ -22,6 +22,18 @@ fn config() -> Config {
     }
 }
 
+#[test]
+fn ascii_requires_explicit_one() {
+    assert!(ascii_requested(Some("1")));
+    assert!(ascii_requested(Some(" 1 ")));
+    for value in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+        assert!(
+            !ascii_requested(value),
+            "unexpected ASCII mode for {value:?}"
+        );
+    }
+}
+
 fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> TokenUsage {
     TokenUsage {
         prompt_tokens: prompt,
@@ -216,14 +228,7 @@ fn wrapping_respects_narrow_widths_and_preserves_span_styles() {
                 }
             }
         }
-        assert_eq!(
-            text,
-            if width == 1 {
-                "�abc�de"
-            } else {
-                "界abc界de"
-            }
-        );
+        assert_eq!(text, if width == 1 { "?abc?de" } else { "界abc界de" });
     }
 }
 

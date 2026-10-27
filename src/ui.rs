@@ -27,17 +27,17 @@ const WARN: Color = Color::Rgb(224, 175, 104);
 const MUTED: Color = Color::Rgb(151, 163, 184);
 const CODE: Color = Color::Rgb(125, 207, 255);
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER: [&str; 4] = ["─", "╱", "│", "╲"];
 const SPINNER_ASCII: [&str; 4] = ["-", "\\", "|", "/"];
 
-/// Glyphs that need a font with good Unicode coverage. Many Windows
-/// terminals render them as boxes, so fall back to plain ASCII there.
+/// Decorative glyphs are limited to characters present in Consolas so the UI
+/// does not fall back to boxes when the terminal uses that font. Plain ASCII
+/// is used only when explicitly requested via `RUST_AGENT_ASCII=1`.
 struct Glyphs {
     user: &'static str,     // prompt gutter for user/assistant messages
     user_bar: &'static str, // green rule to the left of user messages
     think: &'static str,    // gutter for reasoning entries
     err: &'static str,      // gutter for error entries
-    diamond: &'static str,  // banner logo mark
     result: &'static str,   // tool result leader
     block: &'static str,    // streaming cursor block
     quote: &'static str,    // markdown quote bar
@@ -49,12 +49,11 @@ struct Glyphs {
 pub(crate) fn ascii_mode() -> bool {
     use std::sync::OnceLock;
     static ASCII: OnceLock<bool> = OnceLock::new();
-    *ASCII.get_or_init(|| {
-        std::env::var_os("RUST_AGENT_ASCII").is_some()
-            || std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false)
-            || std::env::var_os("WT_SESSION").is_none()
-                && std::env::var_os("TERM_PROGRAM").is_none()
-    })
+    *ASCII.get_or_init(|| ascii_requested(std::env::var("RUST_AGENT_ASCII").ok().as_deref()))
+}
+
+fn ascii_requested(value: Option<&str>) -> bool {
+    value.map(|value| value.trim() == "1").unwrap_or(false)
 }
 
 fn glyphs() -> Glyphs {
@@ -68,7 +67,6 @@ fn glyphs_for(ascii: bool) -> Glyphs {
             user_bar: "| ",
             think: "* ",
             err: "x ",
-            diamond: ">_ ",
             result: "  `- ",
             block: "|",
             quote: "> ",
@@ -78,14 +76,13 @@ fn glyphs_for(ascii: bool) -> Glyphs {
         }
     } else {
         Glyphs {
-            user: "❯ ",
+            user: "› ",
             user_bar: "▌ ",
-            think: "✻ ",
-            err: "✗ ",
-            diamond: "⌘ ",
-            result: "  ⎿  ",
-            block: "▍",
-            quote: "▎ ",
+            think: "◊ ",
+            err: "× ",
+            result: "  └─ ",
+            block: "▌",
+            quote: "│ ",
             rule: "─",
             ellipsis: '…',
             ascii: false,
@@ -101,9 +98,6 @@ fn fg(c: Color) -> Style {
 }
 fn muted() -> Style {
     fg(MUTED)
-}
-fn bold() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
 }
 
 // ─────────────────────────────────── layout ─────────────────────────────────
@@ -404,7 +398,7 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
             let (icon, state, color) = match t.status {
                 ToolStatus::Running => (spin, "running", ACCENT),
                 ToolStatus::Waiting => ("?", "approval", WARN),
-                ToolStatus::Ok => (if ascii_mode() { "+" } else { "✓" }, "done", OK),
+                ToolStatus::Ok => (if ascii_mode() { "+" } else { "√" }, "done", OK),
                 ToolStatus::Failed => ("x", "failed", ERR),
                 ToolStatus::Denied => ("!", "denied", WARN),
             };
@@ -543,6 +537,97 @@ fn banner_lines(app: &App, width: usize) -> Vec<RLine> {
     banner_with_glyphs(&app.cfg, width, glyphs())
 }
 
+fn pixel_glyph(ch: char, width: usize) -> &'static [&'static str] {
+    match width {
+        5 => match ch {
+            'R' => &["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+            'U' => &["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+            'S' => &["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+            'T' => &["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+            'A' => &["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+            'G' => &["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+            'E' => &["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+            'N' => &["10001", "11001", "10101", "10101", "10011", "10001", "10001"],
+            _ => &["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+        },
+        4 => match ch {
+            'R' => &["1110", "1001", "1001", "1110", "1010", "1001", "1001"],
+            'U' => &["1001", "1001", "1001", "1001", "1001", "1001", "1111"],
+            'S' => &["1111", "1000", "1000", "1110", "0001", "0001", "1110"],
+            'T' => &["1111", "0110", "0110", "0110", "0110", "0110", "0110"],
+            'A' => &["0110", "1001", "1001", "1111", "1001", "1001", "1001"],
+            'G' => &["0111", "1000", "1000", "1011", "1001", "1001", "0111"],
+            'E' => &["1111", "1000", "1000", "1110", "1000", "1000", "1111"],
+            'N' => &["1001", "1101", "1101", "1011", "1011", "1001", "1001"],
+            _ => &["0000", "0000", "0000", "0000", "0000", "0000", "0000"],
+        },
+        _ => match ch {
+            'R' => &["110", "101", "101", "110", "101", "101", "101"],
+            'U' => &["101", "101", "101", "101", "101", "101", "111"],
+            'S' => &["111", "100", "100", "110", "001", "001", "110"],
+            'T' => &["111", "010", "010", "010", "010", "010", "010"],
+            'A' => &["010", "101", "101", "111", "101", "101", "101"],
+            'G' => &["011", "100", "100", "101", "101", "101", "011"],
+            'E' => &["111", "100", "100", "110", "100", "100", "111"],
+            'N' => &["101", "111", "111", "111", "111", "101", "101"],
+            _ => &["000", "000", "000", "000", "000", "000", "000"],
+        },
+    }
+}
+
+/// Render a pixel wordmark. Two terminal cells per pixel keep it close to square;
+/// the font scales between 5x7, 4x7, and 3x7 variants to fit the terminal.
+fn pixel_wordmark(ascii: bool, available: usize) -> Option<Vec<Vec<Span<'static>>>> {
+    let glyph_width = if available >= 108 {
+        5
+    } else if available >= 90 {
+        4
+    } else if available >= 72 {
+        3
+    } else {
+        return None;
+    };
+    let chars: Vec<char> = "RUSTAGENT".chars().collect();
+    let gap_cells = chars.len() - 1 + 1; // one extra cell between RUST and AGENT
+    let total_cells = chars.len() * glyph_width + gap_cells;
+    let mut output = Vec::with_capacity(7);
+
+    for y in 0..7 {
+        let mut spans = Vec::new();
+        let mut x = 0usize;
+        for (index, ch) in chars.iter().enumerate() {
+            if index > 0 {
+                let gap = if index == 4 { 2 } else { 1 };
+                spans.push(Span::raw("  ".repeat(gap)));
+                x += gap;
+            }
+            let rows = pixel_glyph(*ch, glyph_width);
+            for bit in rows[y].chars() {
+                if bit == '1' {
+                    let shade = 82u16 + (x as u16 * 126 / total_cells.max(1) as u16);
+                    let gray = shade.min(208) as u8;
+                    let color = Color::Rgb(gray, gray, gray);
+                    let pixel = if ascii {
+                        if (x + y * 3) % 13 == 0 { "::" } else { "##" }
+                    } else if (x + y * 3) % 13 == 0 {
+                        "▒▒"
+                    } else if (x * 2 + y) % 9 == 0 {
+                        "▓▓"
+                    } else {
+                        "██"
+                    };
+                    spans.push(Span::styled(pixel, fg(color).add_modifier(Modifier::BOLD)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                x += 1;
+            }
+        }
+        output.push(spans);
+    }
+    Some(output)
+}
+
 fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
     if width < 2 {
         return Vec::new();
@@ -571,21 +656,31 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
         ("folder", fit_left(&cwd, max_val, g.ellipsis)),
     ];
 
-    let logo = fit(g.diamond, available, g.ellipsis);
-    let logo_width = logo.chars().map(cw).sum::<usize>();
+    let mut art_rows = pixel_wordmark(g.ascii, available).unwrap_or_else(|| {
+        vec![vec![Span::styled(
+            fit("RUST AGENT", available, g.ellipsis),
+            fg(Color::Rgb(180, 180, 180)).add_modifier(Modifier::BOLD),
+        )]]
+    });
+    let art_width = art_rows
+        .iter()
+        .map(|spans| Line::from(spans.clone()).width())
+        .max()
+        .unwrap_or(0);
     let title = fit(
         &format!("rust-agent v{}", env!("CARGO_PKG_VERSION")),
-        available.saturating_sub(logo_width),
+        available,
         g.ellipsis,
     );
-    let inner = rows
+    let title_width = title.chars().map(cw).sum::<usize>();
+    let metadata_width = rows
         .iter()
         .map(|(_, val)| label_width + val.chars().map(cw).sum::<usize>())
         .max()
-        .unwrap_or(0)
-        .max(title.chars().map(cw).sum::<usize>() + logo_width);
+        .unwrap_or(0);
+    let inner = art_width.max(title_width).max(metadata_width);
 
-    let border = muted();
+    let border = fg(Color::Rgb(110, 110, 110));
     let mut v: Vec<RLine> = Vec::new();
     if !g.ascii {
         v.push((
@@ -613,16 +708,20 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
         (Line::from(all), 0)
     };
 
+    for spans in art_rows.drain(..) {
+        v.push(row(spans));
+    }
+    let title_pad = inner.saturating_sub(title_width) / 2;
     v.push(row(vec![
-        Span::styled(logo, fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(title, bold()),
+        Span::raw(" ".repeat(title_pad)),
+        Span::styled(title, fg(Color::Rgb(170, 170, 170)).add_modifier(Modifier::BOLD)),
     ]));
     v.push(row(vec![]));
     for (key, val) in rows {
         let label = fit(key, label_width, g.ellipsis);
         v.push(row(vec![
-            Span::styled(format!("{label:<label_width$}"), muted()),
-            Span::raw(val),
+            Span::styled(format!("{label:<label_width$}"), fg(Color::Rgb(135, 135, 135))),
+            Span::styled(val, fg(Color::Rgb(185, 185, 185))),
         ]));
     }
     if !g.ascii {
@@ -635,15 +734,6 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
             0,
         ));
     }
-    v.push((Line::from(""), 0));
-    let sep = if g.ascii { "-" } else { "·" };
-    v.push((
-        Line::from(Span::styled(
-            format!(" Enter send {sep} \\+Enter new line {sep} Esc interrupt {sep} /help commands"),
-            muted(),
-        )),
-        1,
-    ));
     v
 }
 
@@ -1087,7 +1177,7 @@ pub fn wrap_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'s
                     chars.push((' ', style));
                 }
             } else if !c.is_control() {
-                chars.push((if cw(c) > width { '�' } else { c }, style));
+                chars.push((if cw(c) > width { '?' } else { c }, style));
             }
         }
     }
@@ -1390,8 +1480,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "Esc stop".to_string()
         }
-    } else if left_area.width >= 48 {
-        "enter send | Ctrl+J newline | /help | F2 select".to_string()
+    } else if left_area.width >= 53 {
+        "enter send | Shift+Enter newline | /help | F2 select".to_string()
     } else if left_area.width >= 19 {
         "enter send | /help".to_string()
     } else {

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn config(model: &str, folder: &str) -> Config {
@@ -22,6 +23,16 @@ fn text(line: &Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+fn has_pixel_art(width: usize, ascii: bool) -> bool {
+    let padding = width.saturating_sub(2).saturating_div(2).min(2);
+    let available = if ascii {
+        width.saturating_sub(padding)
+    } else {
+        width.saturating_sub(2 + padding * 2)
+    };
+    available >= 72
 }
 
 #[test]
@@ -48,6 +59,28 @@ fn truncation_respects_display_width() {
 }
 
 #[test]
+fn pixel_wordmark_scales_and_uses_grayscale() {
+    for (available, expected_width) in [(72, 72), (90, 90), (108, 108)] {
+        let rows = pixel_wordmark(false, available).expect("wordmark should fit");
+        assert_eq!(rows.len(), 7);
+        for row in &rows {
+            assert_eq!(Line::from(row.clone()).width(), expected_width);
+        }
+        let shades: HashSet<(u8, u8, u8)> = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter_map(|span| match span.style.fg {
+                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+                _ => None,
+            })
+            .collect();
+        assert!(shades.len() > 5, "wordmark should use a grayscale gradient");
+        assert!(shades.iter().all(|(r, g, b)| r == g && g == b));
+    }
+    assert!(pixel_wordmark(false, 71).is_none());
+}
+
+#[test]
 fn banners_fit_without_wrapping() {
     let long_model = "模型-model-".repeat(20);
     let long_folder = format!("{}rust-agent", "目录/".repeat(40));
@@ -65,30 +98,33 @@ fn banners_fit_without_wrapping() {
                     assert!(lines.is_empty());
                     continue;
                 }
-                assert_eq!(lines.len(), if ascii { 7 } else { 10 });
-                let content_lines = if ascii { 5 } else { 8 };
-                for (line, hang) in &lines[..content_lines] {
+                let art = has_pixel_art(width, ascii);
+                let expected_lines = match (ascii, art) {
+                    (true, true) => 12,
+                    (true, false) => 6,
+                    (false, true) => 15,
+                    (false, false) => 9,
+                };
+                assert_eq!(lines.len(), expected_lines, "width={width}, ascii={ascii}");
+                for (line, hang) in &lines {
                     assert!(line.width() <= width, "width={width}, ascii={ascii}");
                     let wrapped = wrap_line(line, width, *hang);
                     assert_eq!(wrapped.len(), 1, "width={width}, ascii={ascii}");
                     assert_eq!(text(&wrapped[0]), text(line));
                 }
                 if ascii {
-                    assert!(text(&lines[1].0).trim().is_empty());
-                    assert!(text(&lines[5].0).is_empty());
+                    assert!(text(&lines[0].0).is_ascii());
                 } else {
                     let frame_width = lines[0].0.width();
-                    for (line, _) in &lines[..8] {
+                    for (line, _) in &lines {
                         assert_eq!(line.width(), frame_width, "width={width}");
                     }
                     assert!(text(&lines[0].0).starts_with('╭'));
-                    assert!(text(&lines[7].0).starts_with('╰'));
-                    for (line, _) in &lines[1..7] {
+                    assert!(text(&lines.last().unwrap().0).starts_with('╰'));
+                    for (line, _) in &lines[1..lines.len() - 1] {
                         let value = text(line);
                         assert!(value.starts_with('│') && value.ends_with('│'));
                     }
-                    assert_eq!(text(&lines[2].0), text(&lines[6].0));
-                    assert!(text(&lines[8].0).is_empty());
                 }
             }
         }
@@ -96,49 +132,42 @@ fn banners_fit_without_wrapping() {
 }
 
 #[test]
-fn unicode_banner_has_balanced_padding() {
+fn unicode_banner_uses_pixel_wordmark_and_gray_metadata() {
     let cfg = config("demo", "rust-agent");
-    let lines = banner_with_glyphs(&cfg, 80, glyphs_for(false));
-    assert!(text(&lines[1].0).starts_with("│  ⌘ rust-agent v"));
-    assert!(text(&lines[3].0).starts_with("│  model   demo"));
-    for (line, _) in &lines[1..7] {
-        let value = text(line);
-        assert!(value.starts_with("│  "));
-        assert!(value.ends_with("  │"));
+    let lines = banner_with_glyphs(&cfg, 100, glyphs_for(false));
+    assert_eq!(lines.len(), 15);
+    assert!(text(&lines[1].0).contains("██") || text(&lines[1].0).contains("▓▓"));
+    assert!(text(&lines[7].0).contains("██") || text(&lines[7].0).contains("▓▓"));
+    assert!(text(&lines[8].0).contains("rust-agent v"));
+    assert!(text(&lines[10].0).contains("model"));
+    assert!(text(&lines[11].0).contains("server"));
+    assert!(text(&lines[12].0).contains("folder"));
+    for (line, _) in &lines[1..8] {
+        assert!(text(line).starts_with("│  "));
     }
-    let blank = text(&lines[2].0);
+    let blank = text(&lines[9].0);
     assert!(blank.trim_matches('│').chars().all(|c| c == ' '));
 }
 
 #[test]
-fn ascii_banner_is_borderless_with_aligned_labels() {
+fn ascii_banner_is_borderless_and_has_pixel_wordmark() {
     let cfg = config("demo", "rust-agent");
     let lines = banner_with_glyphs(&cfg, 80, glyphs_for(true));
-    assert_eq!(lines.len(), 7);
-    assert_eq!(
-        text(&lines[0].0),
-        format!("  >_ rust-agent v{}", env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(text(&lines[2].0), "  model   demo");
-    assert_eq!(text(&lines[3].0), "  server  api.example.com");
-    assert_eq!(text(&lines[4].0), "  folder  rust-agent");
-    assert!(text(&lines[1].0).trim().is_empty());
-    assert!(text(&lines[5].0).is_empty());
-    assert!(text(&lines[6].0).contains("/help commands"));
+    assert_eq!(lines.len(), 12);
+    assert!(text(&lines[0].0).contains("##") || text(&lines[0].0).contains("::"));
+    assert!(text(&lines[7].0).contains(&format!("rust-agent v{}", env!("CARGO_PKG_VERSION"))));
+    assert_eq!(text(&lines[9].0), "  model   demo");
+    assert_eq!(text(&lines[10].0), "  server  api.example.com");
+    assert_eq!(text(&lines[11].0), "  folder  rust-agent");
     for (line, _) in &lines {
         let value = text(line);
         assert!(value.is_ascii());
         assert!(!value.contains('|'));
         assert!(!value.contains("+-") && !value.contains("-+"));
     }
-    for index in [0, 2, 3, 4] {
+    for index in [7, 9, 10, 11] {
         assert!(!text(&lines[index].0).ends_with(' '));
     }
-    assert_eq!(lines[0].0.spans[1].style.fg, Some(ACCENT));
-    assert!(lines[0].0.spans[2]
-        .style
-        .add_modifier
-        .contains(Modifier::BOLD));
 }
 
 #[test]
@@ -148,8 +177,8 @@ fn long_folder_keeps_its_tail() {
     for ascii in [false, true] {
         let lines = banner_with_glyphs(&cfg, 40, glyphs_for(ascii));
         let ellipsis = glyphs_for(ascii).ellipsis;
-        let model_index = if ascii { 2 } else { 3 };
-        let folder_index = if ascii { 4 } else { 5 };
+        let model_index = if ascii { 3 } else { 4 };
+        let folder_index = if ascii { 5 } else { 6 };
         assert!(text(&lines[model_index].0).contains(ellipsis));
         let folder_row = text(&lines[folder_index].0);
         assert!(folder_row.contains(ellipsis));

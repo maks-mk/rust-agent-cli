@@ -49,8 +49,7 @@ ENVIRONMENT (or a .env file next to the executable):
                       (default: 100000; 0 disables compression)
     AGENT_AUTO_APPROVE
                       initial auto-approval mode: on/off (default: off)
-    RUST_AGENT_ASCII  set to 1 to force ASCII-only UI glyphs
-                      (auto-enabled in classic cmd.exe terminals)
+    RUST_AGENT_ASCII  set to 1 to force ASCII-only UI glyphs (default: Unicode)
 
 The agent can only read and write files inside the directory it was started in.
 Shell commands run in that directory and need your approval (see /auto).
