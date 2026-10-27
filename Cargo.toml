@@ -1,0 +1,29 @@
+[package]
+name = "rust-agent"
+version = "0.1.0"
+edition = "2021"
+description = "A small terminal (TUI) coding agent for any OpenAI-compatible API"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+command-group = { version = "5.0.1", features = ["with-tokio"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+unicode-width = "0.2"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+codegen-units = 1
