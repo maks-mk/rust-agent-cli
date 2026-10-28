@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub const UNTITLED: &str = "Новая сессия";
@@ -40,6 +41,85 @@ pub struct SessionSummary {
 
 pub struct SessionStore {
     dir: PathBuf,
+    // Fields drop in declaration order: join the writer before releasing the lock.
+    writer: SessionWriter,
+    // Keep the OS lock alive; the file must not be removed on close.
+    _lock: File,
+}
+
+#[derive(Default)]
+struct WriteState {
+    pending: Option<(PathBuf, Session)>,
+    writing: bool,
+    stopping: bool,
+    result: Option<std::result::Result<(), String>>,
+}
+
+type SharedWriteState = std::sync::Arc<(std::sync::Mutex<WriteState>, std::sync::Condvar)>;
+
+struct SessionWriter {
+    shared: SharedWriteState,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SessionWriter {
+    fn new() -> Result<Self> {
+        let shared = SharedWriteState::default();
+        let state = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("session-writer".into())
+            .spawn(move || {
+                let (mutex, ready) = &*state;
+                let mut state = mutex.lock().unwrap();
+                loop {
+                    if let Some((path, session)) = state.pending.take() {
+                        state.writing = true;
+                        drop(state);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            write_json_recoverable(&path, &session)
+                        }))
+                        .map_err(|_| "session writer panicked".to_string())
+                        .and_then(|result| result.map_err(|error| format!("{error:#}")));
+                        state = mutex.lock().unwrap();
+                        state.writing = false;
+                        state.result = Some(result);
+                        ready.notify_all();
+                    } else if state.stopping {
+                        break;
+                    } else {
+                        state = ready.wait(state).unwrap();
+                    }
+                }
+            })
+            .context("cannot start session writer")?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    fn flush(shared: &SharedWriteState) -> Result<()> {
+        let (mutex, ready) = &**shared;
+        let mut state = mutex.lock().unwrap();
+        while state.pending.is_some() || state.writing {
+            state = ready.wait(state).unwrap();
+        }
+        match state.result.take() {
+            Some(Err(error)) => anyhow::bail!(error),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Drop for SessionWriter {
+    fn drop(&mut self) {
+        let (mutex, ready) = &*self.shared;
+        mutex.lock().unwrap().stopping = true;
+        ready.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl SessionStore {
@@ -52,7 +132,24 @@ impl SessionStore {
         let dir = config_dir.join("sessions");
         fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create session directory {}", dir.display()))?;
-        let store = Self { dir };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("store.lock"))
+            .context("cannot open session store lock")?;
+        lock.try_lock().with_context(|| {
+            format!(
+                "cannot lock session store {}; another agent may already be using it",
+                dir.display()
+            )
+        })?;
+        let store = Self {
+            dir,
+            _lock: lock,
+            writer: SessionWriter::new()?,
+        };
 
         let mut restored_session = store
             .read_active_id()
@@ -105,7 +202,30 @@ impl SessionStore {
         })
     }
 
+    pub fn queue_save(&self, session: &mut Session) {
+        session.updated_at = timestamp();
+        let snapshot = (self.session_path(&session.id), session.clone());
+        let (mutex, ready) = &*self.writer.shared;
+        let previous = mutex.lock().unwrap().pending.replace(snapshot);
+        // Release the mutex before freeing a potentially large old history.
+        drop(previous);
+        ready.notify_one();
+    }
+
+    pub fn take_save_result(&self) -> Option<std::result::Result<(), String>> {
+        self.writer.shared.0.lock().unwrap().result.take()
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        let shared = self.writer.shared.clone();
+        tokio::task::spawn_blocking(move || SessionWriter::flush(&shared))
+            .await
+            .context("session flush task failed")?
+    }
+
     pub fn save(&self, session: &mut Session) -> Result<()> {
+        // A fresh explicit save retries a failed autosave, after draining it.
+        let _ = SessionWriter::flush(&self.writer.shared);
         session.updated_at = timestamp();
         write_json_recoverable(&self.session_path(&session.id), session)?;
         Ok(())
@@ -120,6 +240,7 @@ impl SessionStore {
     }
 
     pub fn load(&self, id: &str) -> Result<Option<Session>> {
+        SessionWriter::flush(&self.writer.shared)?;
         // IDs are generated internally and validated to avoid path traversal.
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Ok(None);
@@ -136,6 +257,7 @@ impl SessionStore {
     }
 
     pub fn list(&self) -> Result<Vec<SessionSummary>> {
+        SessionWriter::flush(&self.writer.shared)?;
         let mut sessions = Vec::new();
         let entries = fs::read_dir(&self.dir)
             .with_context(|| format!("cannot read session directory {}", self.dir.display()))?;
@@ -214,10 +336,20 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 fn write_json_recoverable(path: &Path, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
     let tmp = path.with_extension("tmp");
     let backup = backup_path(path);
-    fs::write(&tmp, bytes).with_context(|| format!("cannot write {}", tmp.display()))?;
+    let write_result = (|| -> Result<()> {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        // Drop would discard flush errors. Publish only fully written JSON.
+        writer.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("cannot write {}", tmp.display()));
+    }
 
     if path.exists() {
         let _ = fs::remove_file(&backup);
@@ -261,6 +393,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const LOCK_PROBE_DIR: &str = "RUST_AGENT_TEST_LOCK_DIR";
+
     #[test]
     fn saves_and_restores_active_session() {
         let dir = tempdir().unwrap();
@@ -275,6 +409,7 @@ mod tests {
             .push(serde_json::json!({"role":"user", "content":"hello"}));
         store.save(&mut session).unwrap();
 
+        drop(store);
         let (store2, restored_session, restored) =
             SessionStore::open(dir.path(), &workspace, "model-b", None).unwrap();
         assert!(restored);
@@ -284,6 +419,141 @@ mod tests {
         assert_eq!(restored_session.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(restored_session.history.len(), 1);
         assert_eq!(store2.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let error = SessionStore::open(dir.path(), dir.path(), "model", None)
+            .err()
+            .expect("a second store must not acquire the lock");
+        assert!(error.to_string().contains("cannot lock session store"));
+        drop(store);
+        let (_store, restored, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        assert_eq!(restored.id, session.id);
+    }
+
+    #[test]
+    fn serialization_failure_preserves_previous_json_and_removes_temp() {
+        struct Broken;
+        impl Serialize for Broken {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let path = dir.path().join("session.json");
+        let original = serde_json::json!({"history": ["keep me"]});
+        write_json_recoverable(&path, &original).unwrap();
+        assert!(write_json_recoverable(&path, &Broken).is_err());
+        assert_eq!(read_json_recoverable::<Value>(&path).unwrap(), original);
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn queued_saves_keep_latest_snapshot_and_report_completion() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, mut session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        for revision in 0..100 {
+            session.history = vec![serde_json::json!({"revision": revision})];
+            store.queue_save(&mut session);
+        }
+        store.flush().await.unwrap();
+        assert_eq!(
+            store.load(&session.id).unwrap().unwrap().history,
+            session.history
+        );
+        assert!(store.take_save_result().is_none());
+    }
+
+    #[test]
+    fn explicit_save_follows_queued_snapshot() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, mut session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        session.title = "queued".into();
+        store.queue_save(&mut session);
+        session.title = "explicit".into();
+        store.save(&mut session).unwrap();
+        assert_eq!(store.load(&session.id).unwrap().unwrap().title, "explicit");
+    }
+
+    #[test]
+    fn drop_drains_queue_before_releasing_store_lock() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, mut session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        session.title = "saved on drop".into();
+        store.queue_save(&mut session);
+        drop(store);
+        let (_store, restored, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        assert_eq!(restored.title, "saved on drop");
+    }
+
+    #[tokio::test]
+    async fn failed_queued_save_preserves_previous_session_and_can_be_retried() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, mut session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let original = session.title.clone();
+        let temp = store.session_path(&session.id).with_extension("tmp");
+        fs::create_dir(&temp).unwrap();
+        session.title = "retry me".into();
+        store.queue_save(&mut session);
+        assert!(store.flush().await.is_err());
+        assert_eq!(store.load(&session.id).unwrap().unwrap().title, original);
+        fs::remove_dir(temp).unwrap();
+        store.queue_save(&mut session);
+        store.flush().await.unwrap();
+        assert_eq!(store.load(&session.id).unwrap().unwrap().title, "retry me");
+    }
+
+    #[test]
+    fn damaged_current_and_active_files_recover_backup() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, session, _) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let path = store.session_path(&session.id);
+        fs::copy(&path, backup_path(&path)).unwrap();
+        fs::write(&path, b"broken JSON").unwrap();
+        fs::write(store.dir.join("active.json"), b"broken pointer").unwrap();
+        drop(store);
+        let (_store, restored, recovered) =
+            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        assert!(recovered);
+        assert_eq!(restored.id, session.id);
+    }
+
+    #[test]
+    fn store_lock_child_probe() {
+        let Some(dir) = std::env::var_os(LOCK_PROBE_DIR) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let error = SessionStore::open(&dir, &dir, "model", None)
+            .err()
+            .expect("another process must not acquire the store lock");
+        assert!(error.to_string().contains("cannot lock session store"));
+    }
+
+    #[test]
+    fn store_lock_excludes_another_process() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (_store, _, _) = SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session::tests::store_lock_child_probe"])
+            .env(LOCK_PROBE_DIR, dir.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

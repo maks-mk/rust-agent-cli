@@ -686,6 +686,62 @@ async fn compression_is_private_syncs_history_and_preserves_parallel_tool_pairs(
 }
 
 #[tokio::test]
+async fn repeated_compression_uses_latest_request_as_reference_and_merges_prior_memory() {
+    let mut api = MockApi::start(vec![sse(vec![delta(json!({
+        "content":"Changes made; verification pending."
+    }))])])
+    .await;
+    let original = vec![
+        json!({"role":"user", "content":format!("{CONTEXT_SUMMARY_PREFIX}{}", "Prior decisions; tests not run. ".repeat(100))}),
+        json!({"role":"user", "content":"Improve compression without bloating the prompt"}),
+        json!({"role":"assistant", "content":"Implemented changes; verification pending. ".repeat(100), "responses_output_items": [{"type":"message"}]}),
+        json!({"role":"assistant", "content":"Next: run the tests"}),
+    ];
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let compressed = compress_context(&reqwest::Client::new(), &api.cfg, &original, &tx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(is_context_summary(&compressed[0]));
+    assert_eq!(compressed[1..], [original[1].clone(), original[3].clone()]);
+
+    let requests = api.requests().await;
+    let input: Value =
+        serde_json::from_str(requests[0]["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(input["latest_user_request"], original[1]["content"]);
+    let mut updated = original[2].clone();
+    updated
+        .as_object_mut()
+        .unwrap()
+        .remove("responses_output_items");
+    assert_eq!(
+        input["messages_to_summarize"],
+        json!([original[0], updated])
+    );
+}
+
+#[tokio::test]
+async fn compression_without_user_request_keeps_reference_empty() {
+    let mut api =
+        MockApi::start(vec![sse(vec![delta(json!({"content":"Earlier results"}))])]).await;
+    let original = vec![
+        json!({"role":"assistant", "content":"Earlier results ".repeat(500)}),
+        json!({"role":"assistant", "content":"Current state"}),
+    ];
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let compressed = compress_context(&reqwest::Client::new(), &api.cfg, &original, &tx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(compressed[1], original[1]);
+    let requests = api.requests().await;
+    let input: Value =
+        serde_json::from_str(requests[0]["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(input["latest_user_request"].is_null());
+    assert_eq!(input["messages_to_summarize"], json!([original[0]]));
+}
+
+#[tokio::test]
 async fn measured_prompt_growth_triggers_compression_after_tools() {
     let mut api = MockApi::start(vec![
         sse(vec![delta(json!({"tool_calls":[{"index":0, "id":"read", "function":{"name":"read_file", "arguments":"{\"path\":\"note.txt\"}"}}]})), usage(20_000, 5)]),

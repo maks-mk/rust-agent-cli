@@ -107,6 +107,70 @@ async fn stopping_a_background_job_ends_the_process() {
 }
 
 #[tokio::test]
+async fn failed_stop_command_returns_an_error() {
+    let dir = workspace();
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "exit 7"]);
+        command
+    };
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        command
+    };
+    command.current_dir(dir.path());
+    let error = run_stop_command(&mut command).await.unwrap_err();
+    assert!(error.to_string().contains("tree termination failed"));
+    assert!(kill_tree(0).await.is_err());
+}
+
+#[tokio::test]
+async fn locked_job_does_not_block_another_jobs_status() {
+    let make_job = || {
+        let id = new_id();
+        let handle = Arc::new(Mutex::new(Job {
+            info: JobInfo {
+                id: id.clone(),
+                command: String::new(),
+                pid: 0,
+                log_path: PathBuf::new(),
+                log_rel: String::new(),
+                started_at: Local::now(),
+                state: JobState::Stopped,
+            },
+            child: None,
+            stopped: true,
+        }));
+        (id, handle)
+    };
+    let (blocked_id, blocked) = make_job();
+    let (other_id, other) = make_job();
+    jobs()
+        .lock()
+        .await
+        .insert(blocked_id.clone(), blocked.clone());
+    jobs().lock().await.insert(other_id.clone(), other);
+    let guard = blocked.lock().await;
+    let waiting = status(&blocked_id);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(1), status(&other_id)).await;
+    drop(guard);
+    assert_eq!(waiting.await.unwrap().state, JobState::Stopped);
+    let mut registry = jobs().lock().await;
+    registry.remove(&blocked_id);
+    registry.remove(&other_id);
+    assert_eq!(result.unwrap().unwrap().state, JobState::Stopped);
+}
+
+#[tokio::test]
 async fn log_tail_returns_the_end_of_the_log() {
     let dir = workspace();
     let job = start("echo tail-marker", dir.path()).await.unwrap();

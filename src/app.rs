@@ -754,7 +754,7 @@ impl App {
         }
         self.effort_index = (self.effort_index + 1) % self.effort_levels.len();
         self.cfg.reasoning_effort = self.effort_levels[self.effort_index].clone();
-        self.persist_current_session();
+        self.autosave();
     }
 
     /// The reasoning level shown in the footer, if one is active.
@@ -869,12 +869,24 @@ impl App {
         }
     }
 
-    fn persist_current_session(&mut self) {
-        self.session.history = self.history.clone();
-        self.save_current_session();
+    fn persist_current_session(&mut self) -> Result<()> {
+        self.session.history.clone_from(&self.history);
+        self.save_current_session()
     }
 
-    fn save_current_session(&mut self) {
+    fn autosave(&mut self) {
+        self.session.history.clone_from(&self.history);
+        self.prepare_session();
+        self.session_store.queue_save(&mut self.session);
+    }
+
+    pub fn poll_session_save(&mut self) {
+        if let Some(result) = self.session_store.take_save_result() {
+            self.record_save_result(result);
+        }
+    }
+
+    fn prepare_session(&mut self) {
         self.session.tool_entries = self
             .entries
             .iter()
@@ -886,8 +898,25 @@ impl App {
         self.session.model = self.cfg.model.clone();
         self.session.reasoning_effort = self.cfg.reasoning_effort.clone();
         self.session.workspace = self.cfg.root.to_string_lossy().into_owned();
-        match self.session_store.save(&mut self.session) {
-            Ok(()) => self.persistence_error = None,
+    }
+
+    fn save_current_session(&mut self) -> Result<()> {
+        self.prepare_session();
+        let result = self.session_store.save(&mut self.session);
+        self.record_save_result(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}")),
+        );
+        result
+    }
+
+    fn record_save_result(&mut self, result: std::result::Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.persistence_error = None;
+            }
             Err(error) => {
                 let message = format!("Session save failed: {error:#}");
                 if self.persistence_error.as_deref() != Some(message.as_str()) {
@@ -899,33 +928,24 @@ impl App {
     }
 
     fn create_fresh_session(&mut self, workspace: std::path::PathBuf, notice: Option<&str>) {
-        self.persist_current_session();
-        let previous_save_error = self.persistence_error.clone();
-        match self.session_store.new_session(
-            &workspace,
-            &self.cfg.model,
-            self.cfg.reasoning_effort.as_deref(),
-        ) {
-            Ok(mut session) => {
-                let mut notices = Vec::new();
-                let save_error = self.session_store.save(&mut session).err();
-                if let Some(error) = &save_error {
-                    notices.push(format!("Session save failed: {error:#}"));
-                }
-                if let Err(error) = self.session_store.activate(&session.id) {
-                    notices.push(format!("Cannot activate session: {error:#}"));
-                }
+        if self.persist_current_session().is_err() {
+            return;
+        }
+        let prepared = (|| -> Result<Session> {
+            let mut session = self.session_store.new_session(
+                &workspace,
+                &self.cfg.model,
+                self.cfg.reasoning_effort.as_deref(),
+            )?;
+            self.session_store.save(&mut session)?;
+            self.session_store.activate(&session.id)?;
+            Ok(session)
+        })();
+        match prepared {
+            Ok(session) => {
                 self.cfg.root = workspace;
                 self.session = session;
                 self.reset_conversation_state();
-                self.persistence_error =
-                    save_error.map(|error| format!("Session save failed: {error:#}"));
-                if let Some(message) = previous_save_error {
-                    self.entries.push(Entry::Warning(message));
-                }
-                for message in notices {
-                    self.entries.push(Entry::Warning(message));
-                }
                 if let Some(message) = notice {
                     self.entries.push(Entry::Notice(message.into()));
                 }
@@ -966,15 +986,13 @@ impl App {
             return Ok(true);
         }
 
-        self.persist_current_session();
-        let previous_save_error = self.persistence_error.clone();
+        self.persist_current_session()?;
         let Some(mut session) = self.session_store.load(id)? else {
             return Ok(false);
         };
 
-        let workspace = std::path::PathBuf::from(&session.workspace);
+        let mut workspace = std::path::PathBuf::from(&session.workspace);
         let workspace_warning = if workspace.is_dir() {
-            self.cfg.root = workspace;
             None
         } else {
             let warning = format!(
@@ -982,11 +1000,13 @@ impl App {
                 display_path(&session.workspace),
                 display_path(&self.cfg.root)
             );
-            session.workspace = self.cfg.root.to_string_lossy().into_owned();
+            workspace = self.cfg.root.clone();
+            session.workspace = workspace.to_string_lossy().into_owned();
             Some(warning)
         };
 
         self.session_store.activate(&session.id)?;
+        self.cfg.root = workspace;
         self.cfg.model = session.model.clone();
         self.cfg.reasoning_effort = session.reasoning_effort.clone();
         let (levels, index) = effort_cycle(
@@ -1003,16 +1023,13 @@ impl App {
         if let Some(message) = workspace_warning {
             self.entries.push(Entry::Warning(message));
         }
-        if let Some(message) = previous_save_error {
-            self.entries.push(Entry::Warning(message));
-        }
         self.entries.push(Entry::Notice(format!(
             "Switched to session: {}",
             self.session.title
         )));
         self.token_usage = ChatUsage::default();
         self.context_tokens = 0;
-        self.persist_current_session();
+        self.autosave();
         Ok(true)
     }
 
@@ -1153,7 +1170,7 @@ impl App {
         self.history
             .push(json!({ "role": "user", "content": text }));
         self.last_submit = text;
-        self.persist_current_session();
+        self.autosave();
         self.start_run();
     }
 
@@ -1264,7 +1281,7 @@ impl App {
                     self.cfg.model = arg.to_string();
                     self.entries
                         .push(Entry::Notice(format!("Model set to {arg}")));
-                    self.persist_current_session();
+                    self.autosave();
                 }
             }
             "/auto" => {
@@ -1338,12 +1355,14 @@ impl App {
         }
     }
 
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
         }
         self.mcp.lock().await.shutdown().await;
+        self.autosave();
+        self.session_store.flush().await
     }
 
     fn cancel(&mut self) {
@@ -1376,7 +1395,7 @@ impl App {
         self.cancelling = false;
         self.fail_open_tools("Interrupted");
         self.rollback_unanswered();
-        self.persist_current_session();
+        self.autosave();
         self.entries.push(Entry::Notice("Interrupted".into()));
     }
 
@@ -1522,7 +1541,7 @@ impl App {
                 self.history.splice(start..end, messages.iter().cloned());
                 self.session.history.splice(start..end, messages);
                 self.history_mark = self.history.len();
-                self.save_current_session();
+                self.autosave();
             }
             AgentEvent::Sync(h) => {
                 self.history_mark = if h.last().is_some_and(agent::is_user_request) {
@@ -1531,12 +1550,12 @@ impl App {
                     h.len()
                 };
                 self.history = h;
-                self.persist_current_session();
+                self.autosave();
             }
             AgentEvent::Done(h) => {
                 self.compressing_context = false;
                 self.history = h;
-                self.persist_current_session();
+                self.autosave();
                 self.token_usage.finish_turn();
                 if !self.cancelling {
                     self.running = false;
@@ -1559,7 +1578,7 @@ impl App {
                     self.fail_open_tools("Failed");
                     self.entries.push(Entry::Error(e));
                     self.rollback_unanswered();
-                    self.persist_current_session();
+                    self.autosave();
                 }
             }
         }

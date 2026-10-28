@@ -256,8 +256,8 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = run(&mut terminal, &mut app, &mut rx, &capture_mouse).await;
     restore_terminal();
-    app.shutdown().await;
-    result
+    let saved = app.shutdown().await;
+    result.and(saved)
 }
 
 async fn run(
@@ -322,6 +322,7 @@ async fn run(
         }
 
         app.finish_cancel(rx).await;
+        app.poll_session_save();
         if app.should_quit {
             break;
         }

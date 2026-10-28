@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -103,10 +103,11 @@ struct Job {
     stopped: bool,
 }
 
-static JOBS: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
+type JobHandle = Arc<Mutex<Job>>;
+static JOBS: OnceLock<Mutex<HashMap<String, JobHandle>>> = OnceLock::new();
 
 /// The registry of background jobs of this agent process.
-fn jobs() -> &'static Mutex<HashMap<String, Job>> {
+fn jobs() -> &'static Mutex<HashMap<String, JobHandle>> {
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -148,62 +149,63 @@ pub async fn start(command: &str, root: &Path) -> Result<JobInfo> {
     };
     jobs().lock().await.insert(
         id,
-        Job {
+        Arc::new(Mutex::new(Job {
             info: info.clone(),
             child: Some(child),
             stopped: false,
-        },
+        })),
     );
     Ok(info)
 }
 
 /// Return the current state of a background job.
 pub async fn status(id: &str) -> Result<JobInfo> {
-    let mut map = jobs().lock().await;
-    let job = map
-        .get_mut(id)
+    let handle = jobs()
+        .lock()
+        .await
+        .get(id)
+        .cloned()
         .ok_or_else(|| anyhow!("unknown background job '{id}'"))?;
-    refresh(job).await;
+    let mut job = handle.lock().await;
+    refresh(&mut job).await;
     Ok(job.info.clone())
 }
 
 /// Stop a background job and report its final state.
 pub async fn stop(id: &str) -> Result<JobInfo> {
-    let mut map = jobs().lock().await;
-    let job = map
-        .get_mut(id)
+    let handle = jobs()
+        .lock()
+        .await
+        .get(id)
+        .cloned()
         .ok_or_else(|| anyhow!("unknown background job '{id}'"))?;
-    refresh(job).await;
+    let mut job = handle.lock().await;
+    refresh(&mut job).await;
     if job.info.state == JobState::Running {
-        kill_tree(job.info.pid);
-        if let Some(child) = job.child.as_mut() {
-            let _ = child.start_kill();
-        }
-        // The job was stopped on request, so the state reports that and not
-        // the exit code of the killed process.
+        let pid = job.info.pid;
+        let child = job
+            .child
+            .as_mut()
+            .ok_or_else(|| anyhow!("background job '{id}' has no process handle"))?;
+        kill_tree(pid).await?;
+        tokio::time::timeout(STOP_WAIT, child.wait())
+            .await
+            .context("timed out waiting for the background process to stop")?
+            .context("cannot confirm background process termination")?;
+        // Only publish success after the tree command and wait both succeed.
         job.stopped = true;
         job.info.state = JobState::Stopped;
-        let deadline = tokio::time::Instant::now() + STOP_WAIT;
-        while tokio::time::Instant::now() < deadline {
-            let Some(child) = job.child.as_mut() else {
-                break;
-            };
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) => {}
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
     }
     Ok(job.info.clone())
 }
 
 /// Return every known background job, oldest first.
 pub async fn list() -> Vec<JobInfo> {
-    let mut map = jobs().lock().await;
-    let mut out = Vec::with_capacity(map.len());
-    for job in map.values_mut() {
-        refresh(job).await;
+    let handles: Vec<_> = jobs().lock().await.values().cloned().collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let mut job = handle.lock().await;
+        refresh(&mut job).await;
         out.push(job.info.clone());
     }
     out.sort_by_key(|job| job.started_at);
@@ -348,25 +350,38 @@ fn spawn_with(
 }
 
 /// Terminate a background job together with the processes it started.
-fn kill_tree(pid: u32) {
+async fn kill_tree(pid: u32) -> Result<()> {
+    anyhow::ensure!(pid > 0, "cannot stop a background job with an invalid pid");
     #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    let mut command = {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        command
+    };
     #[cfg(unix)]
-    {
-        // The job leads its own process group, so the negative pid signals
-        // every process the job started.
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    let mut command = {
+        // Explicit stop is forceful on both platforms. Kill the entire group,
+        // not just the shell: descendants may ignore SIGTERM.
+        let mut command = Command::new("kill");
+        command.args(["-KILL", "--", &format!("-{pid}")]);
+        command
+    };
+    run_stop_command(&mut command).await
+}
+
+async fn run_stop_command(command: &mut Command) -> Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(STOP_WAIT, command.status())
+        .await
+        .context("background tree termination command timed out")?
+        .context("cannot run background tree termination command")?;
+    anyhow::ensure!(
+        status.success(),
+        "background tree termination failed: {status}"
+    );
+    Ok(())
 }

@@ -24,6 +24,28 @@ fn config() -> Config {
     }
 }
 
+#[tokio::test]
+async fn shutdown_waits_for_latest_session_save() {
+    let (mut app, _rx) = app();
+    app.history = vec![json!({"role": "user", "content": "save on shutdown"})];
+    app.shutdown().await.unwrap();
+    let saved = app.session_store.load(&app.session.id).unwrap().unwrap();
+    assert_eq!(saved.history, app.history);
+}
+
+#[tokio::test]
+async fn shutdown_reports_session_save_failure() {
+    let (mut app, _rx) = app();
+    let temp = app
+        .cfg
+        .config_dir
+        .join("sessions")
+        .join(format!("{}.tmp", app.session.id));
+    std::fs::create_dir(&temp).unwrap();
+    assert!(app.shutdown().await.is_err());
+    std::fs::remove_dir(temp).unwrap();
+}
+
 #[test]
 fn history_patches_are_persisted_without_replacing_the_prefix() {
     let (mut app, _rx) = app();
@@ -634,7 +656,7 @@ fn tool_ui_survives_restart_and_session_switch_without_raw_results() {
         id: "shell".into(),
         output: "exit code: 7\nshort summary".into(),
     });
-    app.persist_current_session();
+    app.persist_current_session().unwrap();
     let expected = serde_json::to_value(&app.session.tool_entries).unwrap();
     let history = app.history.clone();
     drop(app);
@@ -676,7 +698,7 @@ fn context_summary_stays_private_after_restart_and_session_switch() {
     assert!(agent::is_user_request(&history[1]));
     assert!(!agent::is_context_summary(&history[2]));
     app.history = history.clone();
-    app.persist_current_session();
+    app.persist_current_session().unwrap();
     drop(app);
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -717,7 +739,7 @@ fn app_restores_the_last_session_after_restart() {
         app.session.title = "Persistent session".into();
         app.history
             .push(json!({"role":"user", "content":"restore me"}));
-        app.persist_current_session();
+        app.persist_current_session().unwrap();
     }
 
     let mut cfg = config();
@@ -735,12 +757,91 @@ fn app_restores_the_last_session_after_restart() {
 }
 
 #[test]
+fn failed_save_prevents_new_session_and_switch() {
+    let (mut app, _rx) = app();
+    let old_id = app.session.id.clone();
+    let old_root = app.cfg.root.clone();
+    let mut target = app
+        .session_store
+        .new_session(&old_root, "other-model", Some("high"))
+        .unwrap();
+    app.session_store.save(&mut target).unwrap();
+    let history = vec![json!({"role":"user", "content":"unsaved message"})];
+    app.history = history.clone();
+    app.entries.push(Entry::User("unsaved message".into()));
+    let blocked = app
+        .cfg
+        .config_dir
+        .join("sessions")
+        .join(format!("{old_id}.tmp"));
+    std::fs::create_dir(&blocked).unwrap();
+
+    app.command("/clear");
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.history, history);
+    assert_eq!(app.cfg.root, old_root);
+    assert!(app.persistence_error.is_some());
+    assert!(app.switch_session(&target.id).is_err());
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.history, history);
+    assert!(app
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, Entry::User(text) if text == "unsaved message")));
+
+    std::fs::remove_dir(blocked).unwrap();
+    assert!(app.switch_session(&target.id).unwrap());
+    let saved = app.session_store.load(&old_id).unwrap().unwrap();
+    assert_eq!(saved.history, history);
+}
+
+#[test]
+fn failed_activation_preserves_workspace_and_conversation() {
+    let (mut app, _rx) = app();
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let old_id = app.session.id.clone();
+    let old_root = app.cfg.root.clone();
+    let old_model = app.cfg.model.clone();
+    let old_effort = app.cfg.reasoning_effort.clone();
+    let mut target = app
+        .session_store
+        .new_session(dir.path(), "other-model", Some("high"))
+        .unwrap();
+    app.session_store.save(&mut target).unwrap();
+    let history = vec![json!({"role":"user", "content":"keep this conversation"})];
+    app.history = history.clone();
+    let blocked = app.cfg.config_dir.join("sessions/active.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+
+    assert!(app.switch_session(&target.id).is_err());
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.cfg.root, old_root);
+    assert_eq!(app.cfg.model, old_model);
+    assert_eq!(app.cfg.reasoning_effort, old_effort);
+    assert_eq!(app.history, history);
+
+    app.create_fresh_session(dir.path().to_path_buf(), None);
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.cfg.root, old_root);
+    assert_eq!(app.history, history);
+    assert!(app
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, Entry::Error(_))));
+
+    std::fs::remove_dir(blocked).unwrap();
+    assert!(app.switch_session(&target.id).unwrap());
+    assert_eq!(app.cfg.root, dir.path());
+    assert_eq!(app.cfg.model, "other-model");
+}
+
+#[test]
 fn clear_starts_a_new_session_without_deleting_the_previous_one() {
     let (mut app, _rx) = app();
     let old_id = app.session.id.clone();
     app.history
         .push(json!({"role":"user", "content":"keep this"}));
-    app.persist_current_session();
+    app.persist_current_session().unwrap();
 
     app.command("/clear");
 
@@ -756,7 +857,7 @@ fn session_command_lists_and_restores_a_previous_session() {
     let old_id = app.session.id.clone();
     app.history
         .push(json!({"role":"user", "content":"saved prompt"}));
-    app.persist_current_session();
+    app.persist_current_session().unwrap();
     app.command("/clear");
     app.command("/session");
 
