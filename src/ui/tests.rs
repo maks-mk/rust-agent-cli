@@ -44,10 +44,7 @@ fn ascii_requires_explicit_one() {
 #[test]
 fn display_path_hides_the_windows_verbatim_prefix() {
     assert_eq!(display_path(r"\\?\D:\t1"), r"D:\t1");
-    assert_eq!(
-        display_path(r"\\?\UNC\server\share"),
-        r"\\server\share"
-    );
+    assert_eq!(display_path(r"\\?\UNC\server\share"), r"\\server\share");
     assert_eq!(display_path(r"D:\t1"), r"D:\t1");
 }
 
@@ -668,7 +665,15 @@ fn the_command_menu_lists_the_available_commands() {
     let menu: Vec<&String> = rows.iter().filter(|r| r.contains("Commands /")).collect();
     assert_eq!(menu.len(), 1, "expected one menu header: {rows:?}");
 
-    for cmd in ["/model", "/auto", "/clear", "/session", "/workspace", "/help", "/exit"] {
+    for cmd in [
+        "/model",
+        "/auto",
+        "/clear",
+        "/session",
+        "/workspace",
+        "/help",
+        "/exit",
+    ] {
         assert!(
             rows.iter().any(|r| r.contains(cmd)),
             "expected {cmd} in the menu: {rows:?}"
@@ -698,7 +703,8 @@ fn enter_on_a_typed_session_command_shows_the_session_list() {
         "expected the session list: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row.contains(crate::session::UNTITLED)),
+        rows.iter()
+            .any(|row| row.contains(crate::session::UNTITLED)),
         "expected the saved session entry: {rows:?}"
     );
 }

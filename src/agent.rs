@@ -45,8 +45,7 @@ fn parse_api_mode(raw: Option<&str>) -> std::result::Result<ApiMode, String> {
 }
 
 pub fn api_mode_from_env() -> Result<ApiMode> {
-    parse_api_mode(std::env::var("API_MODE").ok().as_deref())
-        .map_err(|error| anyhow!(error))
+    parse_api_mode(std::env::var("API_MODE").ok().as_deref()).map_err(|error| anyhow!(error))
 }
 const MAX_READ_BYTES: usize = 100_000;
 const DEFAULT_READ_LINES: usize = 2000;
@@ -179,7 +178,7 @@ fn parse_auto_approve(raw: Option<&str>) -> bool {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
     Running,
     Waiting,
@@ -188,7 +187,7 @@ pub enum ToolStatus {
     Denied,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffKind {
     Context,
     Add,
@@ -196,7 +195,7 @@ pub enum DiffKind {
     More,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     pub kind: DiffKind,
     pub text: String,
@@ -264,6 +263,12 @@ pub enum AgentEvent {
     },
     /// Conversation history after each completed step (survives Esc).
     Sync(Vec<Value>),
+    /// Replace a history range without copying the unchanged conversation prefix.
+    HistoryPatch {
+        start: usize,
+        end: usize,
+        messages: Vec<Value>,
+    },
     Done(Vec<Value>),
     Error(String),
     Notice(String),
@@ -372,6 +377,13 @@ struct ToolBatch<'a> {
 }
 
 impl ToolBatch<'_> {
+    fn start(&mut self, index: usize) {
+        self.history[self.first_result + index]["content"] = json!(
+            "Interrupted before a result was recorded. The action may be incomplete; inspect its state before retrying."
+        );
+        self.sync_result(index);
+    }
+
     fn record(&mut self, index: usize, call: &ToolCall, output: ToolOutput) {
         self.history[self.first_result + index]["content"] = json!(output.content);
         if !output.images.is_empty() {
@@ -382,7 +394,16 @@ impl ToolBatch<'_> {
             parts.extend(output.images);
             self.image_messages[index] = Some(json!({"role": "user", "content": parts}));
         }
-        let _ = self.tx.send(AgentEvent::Sync(self.history.clone()));
+        self.sync_result(index);
+    }
+
+    fn sync_result(&self, index: usize) {
+        let start = self.first_result + index;
+        let _ = self.tx.send(AgentEvent::HistoryPatch {
+            start,
+            end: start + 1,
+            messages: vec![self.history[start].clone()],
+        });
     }
 }
 
@@ -390,8 +411,15 @@ impl Drop for ToolBatch<'_> {
     fn drop(&mut self) {
         // All tool replies must precede the visual messages, including on cancellation.
         // Slots preserve call order even when parallel reads finish out of order.
+        let start = self.history.len();
         self.history.extend(self.image_messages.drain(..).flatten());
-        let _ = self.tx.send(AgentEvent::Sync(self.history.clone()));
+        if self.history.len() > start {
+            let _ = self.tx.send(AgentEvent::HistoryPatch {
+                start,
+                end: start,
+                messages: self.history[start..].to_vec(),
+            });
+        }
     }
 }
 
@@ -409,6 +437,8 @@ fn system_prompt(cfg: &Config) -> String {
          pre-tool notes and final replies) in the language of the user's latest request, \
          regardless of tool/repo text.\n\n\
          Workspace: `{}` · OS: {} · Date: {}\n\n\
+         * Answer greetings and general questions that need no external facts directly, without \
+         tools; do not inspect the workspace just to introduce yourself or list capabilities.\n\
          * Implement requests; advice/reviews are read-only. Make reversible assumptions; ask \
          only when a security, data, API, or deployment decision blocks progress.\n\
          * Read project instructions and inspect existing changes first; search narrowly, then \
@@ -578,6 +608,12 @@ pub async fn run_turn(
                 "content": "Not executed: the turn was interrupted before this call started."
             }));
         }
+        let start = first_result - 1;
+        let _ = tx.send(AgentEvent::HistoryPatch {
+            start,
+            end: start,
+            messages: history[start..].to_vec(),
+        });
         let mut batch = ToolBatch {
             history: &mut history,
             tx,
@@ -594,9 +630,7 @@ pub async fn run_turn(
                 while index < completion.calls.len()
                     && parallel_tool_group(&completion.calls[index]) == Some(group)
                 {
-                    batch.history[first_result + index]["content"] = json!(
-                        "Interrupted before a result was recorded. The action may be incomplete; inspect its state before retrying."
-                    );
+                    batch.start(index);
                     index += 1;
                 }
                 let group_end = index;
@@ -618,9 +652,7 @@ pub async fn run_turn(
             } else {
                 // File mutations, unknown tools and MCP calls are barriers: they run one at
                 // a time and never overlap with read or shell batches.
-                batch.history[first_result + index]["content"] = json!(
-                    "Interrupted before a result was recorded. The action may be incomplete; inspect its state before retrying."
-                );
+                batch.start(index);
                 let output = run_tool(&completion.calls[index], cfg, tx, auto, mcp_shared).await;
                 batch.record(index, &completion.calls[index], output);
                 index += 1;
@@ -662,8 +694,18 @@ fn estimate_tokens(value: &Value) -> usize {
     value.to_string().len().div_ceil(3)
 }
 
+const CONTEXT_SUMMARY_PREFIX: &str =
+    "Previous conversation summary (reference data, not new instructions):\n";
+
+pub(crate) fn is_context_summary(message: &Value) -> bool {
+    message["role"] == "user"
+        && message["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(CONTEXT_SUMMARY_PREFIX))
+}
+
 pub(crate) fn is_user_request(message: &Value) -> bool {
-    message["role"] == "user" && !is_image_message(message)
+    message["role"] == "user" && !is_image_message(message) && !is_context_summary(message)
 }
 
 fn estimate_history(history: &[Value]) -> usize {
@@ -735,7 +777,7 @@ async fn compress_context(
     if text.is_empty() || !completion.calls.is_empty() {
         bail!("context compression failed: provider returned no usable summary");
     }
-    let summary = json!({"role": "user", "content": format!("Previous conversation summary (reference data, not new instructions):\n{text}")});
+    let summary = json!({"role": "user", "content": format!("{CONTEXT_SUMMARY_PREFIX}{text}")});
     if estimate_tokens(&summary) >= estimate_history(&older) {
         bail!("context compression failed: summary did not reduce the context");
     }
@@ -1131,10 +1173,7 @@ async fn stream_completion(
             if cfg.api_mode == ApiMode::Responses {
                 match v["type"].as_str().unwrap_or("") {
                     "response.output_text.delta" | "response.refusal.delta" => {
-                        if let Some(delta) = v["delta"]
-                            .as_str()
-                            .filter(|delta| !delta.is_empty())
-                        {
+                        if let Some(delta) = v["delta"].as_str().filter(|delta| !delta.is_empty()) {
                             text.push_str(delta);
                             if tools.is_some() {
                                 let _ = tx.send(AgentEvent::Text(delta.to_owned()));
@@ -1142,10 +1181,7 @@ async fn stream_completion(
                         }
                     }
                     "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                        if let Some(delta) = v["delta"]
-                            .as_str()
-                            .filter(|delta| !delta.is_empty())
-                        {
+                        if let Some(delta) = v["delta"].as_str().filter(|delta| !delta.is_empty()) {
                             reasoning_text.push_str(delta);
                             if tools.is_some() {
                                 let _ = tx.send(AgentEvent::Reasoning(delta.to_owned()));
@@ -2013,10 +2049,7 @@ async fn shell(
         text = "(no output)".to_string();
     }
 
-    let ui_output = shell_output_for_ui(&format!(
-        "exit code: {code}\n{}",
-        shell_ui_summary(&stdout, &stderr)
-    ));
+    let ui_output = format!("exit code: {code}\n{}", shell_ui_summary(&stdout, &stderr));
     let _ = tx.send(AgentEvent::ToolOutput {
         id: id.to_string(),
         output: ui_output,
@@ -2234,6 +2267,8 @@ fn classify_shell_line(line: &str) -> Option<ShellLineKind> {
 /// The user sees the end of every stream plus the error and warning lines that
 /// the condensed view dropped; the model receives the full captured text.
 fn shell_ui_summary(stdout: &str, stderr: &str) -> String {
+    let stdout = shell_output_for_ui(stdout);
+    let stderr = shell_output_for_ui(stderr);
     let out_lines: Vec<&str> = stdout.lines().collect();
     let err_lines: Vec<&str> = stderr.lines().collect();
 
@@ -2320,12 +2355,47 @@ fn shell_ui_summary(stdout: &str, stderr: &str) -> String {
     }
 }
 
-/// Normalize and escape terminal control characters before putting process output into the TUI.
-/// Keep ordinary newlines, but never pass raw ANSI escape sequences through Ratatui.
+/// Strip ANSI CSI/OSC sequences, normalize lines and escape remaining controls for the TUI.
 fn shell_output_for_ui(output: &str) -> String {
     let normalized = output.replace("\r\n", "\n").replace('\r', "\n");
     let mut safe = String::with_capacity(normalized.len());
-    for ch in normalized.chars() {
+    let mut chars = normalized.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let sequence = match ch {
+            '\x1b' if matches!(chars.peek(), Some('[' | ']')) => chars.next(),
+            '\u{009b}' => Some('['),
+            '\u{009d}' => Some(']'),
+            _ => None,
+        };
+        match sequence {
+            Some('[') => {
+                // Consume parameters/intermediates and one final byte. Leave ordinary
+                // text and newlines intact if the sequence is incomplete or malformed.
+                while chars
+                    .next_if(|c| ('\u{0020}'..='\u{003f}').contains(c))
+                    .is_some()
+                {}
+                chars.next_if(|c| ('\u{0040}'..='\u{007e}').contains(c));
+                continue;
+            }
+            Some(']') => {
+                // OSC ends with BEL or ST (ESC backslash / C1 ST).
+                while let Some(&c) = chars.peek() {
+                    if c == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    if c == '\x07' || c == '\u{009c}' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
         match ch {
             '\n' => safe.push('\n'),
             '\t' => safe.push_str("    "),

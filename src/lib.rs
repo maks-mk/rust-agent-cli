@@ -1,4 +1,4 @@
-//! Shared agent engine used by both the terminal UI and the Tauri desktop UI.
+//! Agent engine for the terminal UI, also exported as a library.
 
 pub mod agent;
 pub mod background;

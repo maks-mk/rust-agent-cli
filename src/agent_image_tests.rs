@@ -286,25 +286,23 @@ async fn cancelling_after_image_read_preserves_visuals_and_tool_pairs() {
         )
         .await
     });
+    let mut history = vec![json!({"role":"user", "content":"Inspect then write"})];
     let approval = loop {
-        if let AgentEvent::ToolApproval { reply, .. } = timeout(Duration::from_secs(10), rx.recv())
+        match timeout(Duration::from_secs(10), rx.recv())
             .await
             .unwrap()
             .unwrap()
         {
-            break reply;
+            AgentEvent::ToolApproval { reply, .. } => break reply,
+            event => apply_history_event(&mut history, event),
         }
     };
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     drop(approval);
-    let mut latest = None;
     while let Ok(event) = rx.try_recv() {
-        if let AgentEvent::Sync(history) = event {
-            latest = Some(history);
-        }
+        apply_history_event(&mut history, event);
     }
-    let history = latest.unwrap();
     assert_eq!(history[2]["tool_call_id"], "image");
     assert_eq!(history[3]["tool_call_id"], "write");
     assert!(is_image_message(&history[4]));

@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 // ─────────────────────────────── chat entries ───────────────────────────────
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolEntry {
     pub id: String,
     pub label: String,
@@ -471,9 +472,12 @@ impl App {
         session_store.save(&mut session)?;
         session_store.activate(&session.id)?;
         let history = session.history.clone();
-        let mut entries = entries_from_history(&history);
+        let mut entries = entries_from_history(&history, &session.tool_entries);
         if restored {
-            entries.push(Entry::Notice(format!("Restored session: {}", session.title)));
+            entries.push(Entry::Notice(format!(
+                "Restored session: {}",
+                session.title
+            )));
         }
         Ok(Self {
             cfg,
@@ -820,7 +824,11 @@ impl App {
     }
 
     pub fn session_menu_visible(&self) -> bool {
-        self.pending.is_none() && self.session_menu.as_ref().is_some_and(|m| !m.items.is_empty())
+        self.pending.is_none()
+            && self
+                .session_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty())
     }
 
     pub fn active_session_id(&self) -> &str {
@@ -828,7 +836,9 @@ impl App {
     }
 
     fn session_move(&mut self, delta: i32) {
-        let Some(menu) = &mut self.session_menu else { return };
+        let Some(menu) = &mut self.session_menu else {
+            return;
+        };
         if menu.items.is_empty() {
             return;
         }
@@ -837,18 +847,38 @@ impl App {
     }
 
     fn session_accept(&mut self) {
-        let Some(menu) = self.session_menu.take() else { return };
-        let Some(item) = menu.items.get(menu.selected) else { return };
+        let Some(menu) = self.session_menu.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
         let id = item.id.clone();
         match self.switch_session(&id) {
             Ok(true) => {}
-            Ok(false) => self.entries.push(Entry::Error(format!("Session not found: {id}"))),
-            Err(error) => self.entries.push(Entry::Error(format!("Cannot switch session: {error:#}"))),
+            Ok(false) => self
+                .entries
+                .push(Entry::Error(format!("Session not found: {id}"))),
+            Err(error) => self
+                .entries
+                .push(Entry::Error(format!("Cannot switch session: {error:#}"))),
         }
     }
 
     fn persist_current_session(&mut self) {
         self.session.history = self.history.clone();
+        self.save_current_session();
+    }
+
+    fn save_current_session(&mut self) {
+        self.session.tool_entries = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool(tool) => Some(tool.clone()),
+                _ => None,
+            })
+            .collect();
         self.session.model = self.cfg.model.clone();
         self.session.reasoning_effort = self.cfg.reasoning_effort.clone();
         self.session.workspace = self.cfg.root.to_string_lossy().into_owned();
@@ -884,7 +914,8 @@ impl App {
                 self.cfg.root = workspace;
                 self.session = session;
                 self.reset_conversation_state();
-                self.persistence_error = save_error.map(|error| format!("Session save failed: {error:#}"));
+                self.persistence_error =
+                    save_error.map(|error| format!("Session save failed: {error:#}"));
                 if let Some(message) = previous_save_error {
                     self.entries.push(Entry::Warning(message));
                 }
@@ -895,7 +926,9 @@ impl App {
                     self.entries.push(Entry::Notice(message.into()));
                 }
             }
-            Err(error) => self.entries.push(Entry::Error(format!("Cannot create session: {error:#}"))),
+            Err(error) => self
+                .entries
+                .push(Entry::Error(format!("Cannot create session: {error:#}"))),
         }
     }
 
@@ -952,15 +985,17 @@ impl App {
         self.session_store.activate(&session.id)?;
         self.cfg.model = session.model.clone();
         self.cfg.reasoning_effort = session.reasoning_effort.clone();
-        let (levels, index) =
-            effort_cycle(&self.cfg.reasoning_efforts, self.cfg.reasoning_effort.as_deref());
+        let (levels, index) = effort_cycle(
+            &self.cfg.reasoning_efforts,
+            self.cfg.reasoning_effort.as_deref(),
+        );
         self.effort_levels = levels;
         self.effort_index = index;
         self.cfg.reasoning_effort = self.effort_levels.get(self.effort_index).cloned().flatten();
         self.session = session;
         self.reset_conversation_state();
         self.history = self.session.history.clone();
-        self.entries = entries_from_history(&self.history);
+        self.entries = entries_from_history(&self.history, &self.session.tool_entries);
         if let Some(message) = workspace_warning {
             self.entries.push(Entry::Warning(message));
         }
@@ -1161,7 +1196,9 @@ impl App {
                             self.slash = None;
                         }
                         Ok(_) => self.entries.push(Entry::Notice("No saved sessions".into())),
-                        Err(error) => self.entries.push(Entry::Error(format!("Cannot list sessions: {error:#}"))),
+                        Err(error) => self
+                            .entries
+                            .push(Entry::Error(format!("Cannot list sessions: {error:#}"))),
                     }
                 } else if arg.eq_ignore_ascii_case("new") {
                     self.create_fresh_session(self.cfg.root.clone(), None);
@@ -1169,8 +1206,12 @@ impl App {
                     let id = arg.trim();
                     match self.switch_session(id) {
                         Ok(true) => {}
-                        Ok(false) => self.entries.push(Entry::Error(format!("Session not found: {id}"))),
-                        Err(error) => self.entries.push(Entry::Error(format!("Cannot switch session: {error:#}"))),
+                        Ok(false) => self
+                            .entries
+                            .push(Entry::Error(format!("Session not found: {id}"))),
+                        Err(error) => self
+                            .entries
+                            .push(Entry::Error(format!("Cannot switch session: {error:#}"))),
                     }
                 }
             }
@@ -1184,7 +1225,10 @@ impl App {
                     let unquoted = arg
                         .strip_prefix('"')
                         .and_then(|value| value.strip_suffix('"'))
-                        .or_else(|| arg.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+                        .or_else(|| {
+                            arg.strip_prefix('\'')
+                                .and_then(|value| value.strip_suffix('\''))
+                        })
                         .unwrap_or(arg);
                     let requested = std::path::PathBuf::from(unquoted);
                     let candidate = if requested.is_absolute() {
@@ -1193,9 +1237,18 @@ impl App {
                         self.cfg.root.join(requested)
                     };
                     match std::fs::canonicalize(&candidate) {
-                        Ok(path) if path.is_dir() => self.create_fresh_session(path, Some("Workspace changed; started a new session")),
-                        Ok(_) => self.entries.push(Entry::Error(format!("Workspace is not a directory: {}", display_path(&candidate)))),
-                        Err(error) => self.entries.push(Entry::Error(format!("Cannot access workspace {}: {error}", display_path(&candidate)))),
+                        Ok(path) if path.is_dir() => self.create_fresh_session(
+                            path,
+                            Some("Workspace changed; started a new session"),
+                        ),
+                        Ok(_) => self.entries.push(Entry::Error(format!(
+                            "Workspace is not a directory: {}",
+                            display_path(&candidate)
+                        ))),
+                        Err(error) => self.entries.push(Entry::Error(format!(
+                            "Cannot access workspace {}: {error}",
+                            display_path(&candidate)
+                        ))),
                     }
                 }
             }
@@ -1455,6 +1508,17 @@ impl App {
             AgentEvent::ContextCompression { active } => self.compressing_context = active,
             AgentEvent::UsageStart => self.token_usage.start_request(),
             AgentEvent::Usage { usage, complete } => self.token_usage.record(usage, complete),
+            AgentEvent::HistoryPatch {
+                start,
+                end,
+                messages,
+            } => {
+                // Events from one turn are ordered, including ToolBatch::drop on cancellation.
+                self.history.splice(start..end, messages.iter().cloned());
+                self.session.history.splice(start..end, messages);
+                self.history_mark = self.history.len();
+                self.save_current_session();
+            }
             AgentEvent::Sync(h) => {
                 self.history_mark = if h.last().is_some_and(agent::is_user_request) {
                     h.len().saturating_sub(1)
@@ -1497,9 +1561,12 @@ impl App {
     }
 }
 
-fn entries_from_history(history: &[Value]) -> Vec<Entry> {
+fn entries_from_history(history: &[Value], saved_tools: &[ToolEntry]) -> Vec<Entry> {
     let mut entries = vec![Entry::Banner];
     for message in history {
+        if agent::is_context_summary(message) {
+            continue;
+        }
         match message.get("role").and_then(Value::as_str).unwrap_or("") {
             "user" => {
                 let text = history_content_text(message.get("content").unwrap_or(&Value::Null));
@@ -1520,14 +1587,45 @@ fn entries_from_history(history: &[Value]) -> Vec<Entry> {
                 }
                 if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
-                        let id = call.get("id").and_then(Value::as_str).unwrap_or("restored-tool").to_string();
+                        let id = call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("restored-tool")
+                            .to_string();
+                        if let Some(tool) = saved_tools.iter().find(|tool| tool.id == id) {
+                            entries.push(Entry::Tool(tool.clone()));
+                            continue;
+                        }
                         let function = call.get("function").unwrap_or(&Value::Null);
-                        let label = function.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
-                        let target = match function.get("arguments") {
-                            Some(Value::String(value)) => value.clone(),
-                            Some(value) => value.to_string(),
-                            None => String::new(),
+                        let name = function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let label = match name {
+                            "read_file" => "Read",
+                            "read_images" => "Read images",
+                            "write_file" => "Write",
+                            "edit_file" => "Edit",
+                            "shell" => "Shell",
+                            other => other,
+                        }
+                        .to_string();
+                        let args = match function.get("arguments") {
+                            Some(Value::String(value)) => {
+                                serde_json::from_str(value).unwrap_or(Value::Null)
+                            }
+                            Some(value) => value.clone(),
+                            None => Value::Null,
                         };
+                        let target = args
+                            .get("path")
+                            .or_else(|| args.get("command"))
+                            .or_else(|| args.get("query"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(180)
+                            .collect();
                         entries.push(Entry::Tool(ToolEntry {
                             id,
                             label,
@@ -1541,16 +1639,17 @@ fn entries_from_history(history: &[Value]) -> Vec<Entry> {
                 }
             }
             "tool" => {
-                let id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
-                let result = history_content_text(message.get("content").unwrap_or(&Value::Null));
+                let id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if let Some(tool) = entries.iter_mut().rev().find_map(|entry| match entry {
                     Entry::Tool(tool) if tool.id == id => Some(tool),
                     _ => None,
                 }) {
-                    tool.status = ToolStatus::Ok;
-                    tool.result = Some(result);
-                } else {
-                    entries.push(Entry::Notice(format!("Tool result ({id}): {result}")));
+                    if !saved_tools.iter().any(|saved| saved.id == id) {
+                        tool.status = ToolStatus::Ok;
+                    }
                 }
             }
             _ => {}
@@ -1569,7 +1668,11 @@ fn history_content_text(content: &Value) -> String {
                     Some(text.to_string())
                 } else if part.get("type").and_then(Value::as_str) == Some("text") {
                     part.get("text").and_then(Value::as_str).map(str::to_string)
-                } else if part.get("type").and_then(Value::as_str).is_some_and(|kind| kind.contains("image")) {
+                } else if part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.contains("image"))
+                {
                     Some("[image]".to_string())
                 } else {
                     None

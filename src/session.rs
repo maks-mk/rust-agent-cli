@@ -25,6 +25,8 @@ pub struct Session {
     pub updated_at: String,
     #[serde(default)]
     pub history: Vec<Value>,
+    #[serde(default)]
+    pub tool_entries: Vec<crate::app::ToolEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +101,7 @@ impl SessionStore {
             created_at: now.clone(),
             updated_at: now,
             history: Vec::new(),
+            tool_entries: Vec::new(),
         })
     }
 
@@ -109,7 +112,10 @@ impl SessionStore {
     }
 
     pub fn activate(&self, id: &str) -> Result<()> {
-        write_json_recoverable(&self.dir.join("active.json"), &serde_json::json!({"id": id}))?;
+        write_json_recoverable(
+            &self.dir.join("active.json"),
+            &serde_json::json!({"id": id}),
+        )?;
         Ok(())
     }
 
@@ -136,7 +142,10 @@ impl SessionStore {
         let mut candidates = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
             match path.extension().and_then(|ext| ext.to_str()) {
                 Some("json") if file_name != "active.json" => candidates.push(path),
                 // Recover a session interrupted while its current JSON was being replaced.
@@ -212,8 +221,7 @@ fn write_json_recoverable(path: &Path, value: &impl Serialize) -> Result<()> {
 
     if path.exists() {
         let _ = fs::remove_file(&backup);
-        fs::rename(path, &backup)
-            .with_context(|| format!("cannot back up {}", path.display()))?;
+        fs::rename(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
     }
     if let Err(error) = fs::rename(&tmp, path) {
         if backup.exists() && !path.exists() {
@@ -262,7 +270,9 @@ mod tests {
             SessionStore::open(dir.path(), &workspace, "model-a", Some("high")).unwrap();
         assert!(!restored);
         session.title = "Test session".into();
-        session.history.push(serde_json::json!({"role":"user", "content":"hello"}));
+        session
+            .history
+            .push(serde_json::json!({"role":"user", "content":"hello"}));
         store.save(&mut session).unwrap();
 
         let (store2, restored_session, restored) =

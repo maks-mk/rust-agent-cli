@@ -154,15 +154,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Command completion and the session selector share a menu band.
     let session_menu = app.session_menu_visible();
     let menu_items = if session_menu {
-        app.session_menu.as_ref().map(|m| m.items.len()).unwrap_or(0)
+        app.session_menu
+            .as_ref()
+            .map(|m| m.items.len())
+            .unwrap_or(0)
     } else {
         app.slash.as_ref().map(|m| m.items.len()).unwrap_or(0)
     };
-    let menu_content_lines = if session_menu { menu_items.saturating_mul(2) } else { menu_items };
+    let menu_content_lines = if session_menu {
+        menu_items.saturating_mul(2)
+    } else {
+        menu_items
+    };
     let free = area
         .height
         .saturating_sub(status_h + input_h + usage_h + footer_h + 1);
-    let menu_h = if (session_menu || app.slash_menu_visible()) && app.pending.is_none() && free >= 3 {
+    let menu_h = if (session_menu || app.slash_menu_visible()) && app.pending.is_none() && free >= 3
+    {
         (menu_content_lines as u16 + 2).min(free).min(12)
     } else {
         0
@@ -262,7 +270,9 @@ fn draw_slash_menu(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_session_menu(f: &mut Frame, app: &App, area: Rect) {
-    let Some(menu) = &app.session_menu else { return };
+    let Some(menu) = &app.session_menu else {
+        return;
+    };
     let items: Vec<ListItem> = menu
         .items
         .iter()
@@ -620,15 +630,33 @@ fn banner_lines(app: &App, width: usize) -> Vec<RLine> {
 fn pixel_glyph(ch: char, width: usize) -> &'static [&'static str] {
     match width {
         5 => match ch {
-            'R' => &["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-            'U' => &["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-            'S' => &["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-            'T' => &["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-            'A' => &["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-            'G' => &["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
-            'E' => &["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-            'N' => &["10001", "11001", "10101", "10101", "10011", "10001", "10001"],
-            _ => &["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+            'R' => &[
+                "11110", "10001", "10001", "11110", "10100", "10010", "10001",
+            ],
+            'U' => &[
+                "10001", "10001", "10001", "10001", "10001", "10001", "01110",
+            ],
+            'S' => &[
+                "01111", "10000", "10000", "01110", "00001", "00001", "11110",
+            ],
+            'T' => &[
+                "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+            ],
+            'A' => &[
+                "01110", "10001", "10001", "11111", "10001", "10001", "10001",
+            ],
+            'G' => &[
+                "01110", "10001", "10000", "10111", "10001", "10001", "01110",
+            ],
+            'E' => &[
+                "11111", "10000", "10000", "11110", "10000", "10000", "11111",
+            ],
+            'N' => &[
+                "10001", "11001", "10101", "10101", "10011", "10001", "10001",
+            ],
+            _ => &[
+                "00000", "00000", "00000", "00000", "00000", "00000", "00000",
+            ],
         },
         4 => match ch {
             'R' => &["1110", "1001", "1001", "1110", "1010", "1001", "1001"],
@@ -688,7 +716,11 @@ fn pixel_wordmark(ascii: bool, available: usize) -> Option<Vec<Vec<Span<'static>
                     let gray = shade.min(208) as u8;
                     let color = Color::Rgb(gray, gray, gray);
                     let pixel = if ascii {
-                        if (x + y * 3).is_multiple_of(13) { "::" } else { "##" }
+                        if (x + y * 3).is_multiple_of(13) {
+                            "::"
+                        } else {
+                            "##"
+                        }
                     } else if (x + y * 3).is_multiple_of(13) {
                         "▒▒"
                     } else if (x * 2 + y).is_multiple_of(9) {
@@ -794,13 +826,19 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
     let title_pad = inner.saturating_sub(title_width) / 2;
     v.push(row(vec![
         Span::raw(" ".repeat(title_pad)),
-        Span::styled(title, fg(Color::Rgb(170, 170, 170)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            title,
+            fg(Color::Rgb(170, 170, 170)).add_modifier(Modifier::BOLD),
+        ),
     ]));
     v.push(row(vec![]));
     for (key, val) in rows {
         let label = fit(key, label_width, g.ellipsis);
         v.push(row(vec![
-            Span::styled(format!("{label:<label_width$}"), fg(Color::Rgb(135, 135, 135))),
+            Span::styled(
+                format!("{label:<label_width$}"),
+                fg(Color::Rgb(135, 135, 135)),
+            ),
             Span::styled(val, fg(Color::Rgb(185, 185, 185))),
         ]));
     }

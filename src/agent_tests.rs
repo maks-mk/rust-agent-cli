@@ -10,6 +10,74 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+fn apply_history_event(history: &mut Vec<Value>, event: AgentEvent) {
+    match event {
+        AgentEvent::Sync(messages) => *history = messages,
+        AgentEvent::HistoryPatch {
+            start,
+            end,
+            messages,
+        } => {
+            history.splice(start..end, messages);
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn tool_results_send_only_changed_messages() {
+    let prefix = json!({"role": "user", "content": "large prefix ".repeat(10_000)});
+    let mut history = vec![
+        prefix,
+        json!({"role": "assistant", "tool_calls": []}),
+        json!({"role": "tool", "tool_call_id": "first", "content": "pending"}),
+        json!({"role": "tool", "tool_call_id": "second", "content": "pending"}),
+    ];
+    let mut mirrored = history.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut batch = ToolBatch {
+            history: &mut history,
+            tx: &tx,
+            first_result: 2,
+            image_messages: vec![None, None],
+        };
+        for index in [1, 0] {
+            let call = ToolCall {
+                id: if index == 0 { "first" } else { "second" }.into(),
+                name: "read_file".into(),
+                args: "{}".into(),
+            };
+            batch.record(
+                index,
+                &call,
+                ToolOutput {
+                    content: format!("result {index}"),
+                    images: vec![],
+                },
+            );
+        }
+    }
+    for index in [1, 0] {
+        let event = rx.try_recv().unwrap();
+        match &event {
+            AgentEvent::HistoryPatch {
+                start,
+                end,
+                messages,
+            } => {
+                assert_eq!((*start, *end), (2 + index, 3 + index));
+                assert_eq!(messages.len(), 1);
+                assert!(serde_json::to_vec(messages).unwrap().len() < 200);
+            }
+            _ => panic!("expected a result delta"),
+        }
+        apply_history_event(&mut mirrored, event);
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(mirrored, history);
+}
+
 struct MockApi {
     cfg: Config,
     task: Option<JoinHandle<Vec<Value>>>,

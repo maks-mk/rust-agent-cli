@@ -180,8 +180,14 @@ fn banner_hides_the_verbatim_folder_prefix() {
         .find(|row| row.contains("folder"))
         .expect("folder row");
 
-    assert!(folder.contains(r"D:\t1"), "unexpected folder row: {folder:?}");
-    assert!(!folder.contains(r"\\?\"), "verbatim prefix leaked: {folder:?}");
+    assert!(
+        folder.contains(r"D:\t1"),
+        "unexpected folder row: {folder:?}"
+    );
+    assert!(
+        !folder.contains(r"\\?\"),
+        "verbatim prefix leaked: {folder:?}"
+    );
 }
 
 #[test]

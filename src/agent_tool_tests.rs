@@ -278,7 +278,7 @@ async fn cancelling_tool_batch_preserves_completed_and_pairs_unfinished_calls() 
         )
         .await
     });
-    let mut history = None;
+    let mut history = vec![json!({"role":"user", "content":"write files"})];
     loop {
         match timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -292,17 +292,13 @@ async fn cancelling_tool_batch_preserves_completed_and_pairs_unfinished_calls() 
                 task.abort();
                 break;
             }
-            AgentEvent::Sync(h) => history = Some(h),
-            _ => {}
+            event => apply_history_event(&mut history, event),
         }
     }
     assert!(task.await.unwrap_err().is_cancelled());
     while let Ok(event) = rx.try_recv() {
-        if let AgentEvent::Sync(h) = event {
-            history = Some(h);
-        }
+        apply_history_event(&mut history, event);
     }
-    let history = history.unwrap();
     assert_eq!(history.len(), 5);
     assert_eq!(history[1]["tool_calls"].as_array().unwrap().len(), 3);
     for i in 0..3 {
@@ -596,6 +592,54 @@ async fn shell_exit_status_preserves_both_streams_for_the_model() {
         assert_eq!(status, expected);
         assert_eq!(result, summary);
         assert!(content.contains(&format!("exit code: {code}\nstdout-marker\nstderr-marker")));
+    }
+}
+
+#[tokio::test]
+async fn shell_tool_formats_empty_and_ansi_output_with_exit_code() {
+    let api = MockApi::start(vec![]).await;
+    let auto = Arc::new(AtomicBool::new(true));
+    for (code, ansi, label) in [
+        (0, false, ""),
+        (7, false, ""),
+        (0, true, ""),
+        (7, true, "Path"),
+    ] {
+        let command = if !ansi {
+            format!("exit {code}")
+        } else if cfg!(windows) {
+            format!("[Console]::Out.Write(([string][char]27) + '[32;1m{label}' + ([string][char]27) + '[0m'); exit {code}")
+        } else {
+            format!("printf '\\033[32;1m{label}\\033[0m'; exit {code}")
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (status, _, content) =
+            shell("format", &json!({"command": command}), &api.cfg, &tx, &auto).await;
+        assert_eq!(
+            status,
+            if code == 0 {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Failed
+            }
+        );
+        let expected = if label.is_empty() {
+            "(no output)"
+        } else {
+            label
+        };
+        let mut outputs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ToolOutput { output, .. } = event {
+                outputs.push(output);
+            }
+        }
+        assert_eq!(outputs, [format!("exit code: {code}\n{expected}")]);
+        if ansi {
+            assert!(content.contains(&format!("\x1b[32;1m{label}\x1b[0m")));
+        } else {
+            assert!(content.ends_with(&format!("exit code: {code}\n(no output)")));
+        }
     }
 }
 

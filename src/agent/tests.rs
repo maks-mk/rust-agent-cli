@@ -242,6 +242,9 @@ fn system_prompt_is_compact_and_covers_essential_policy() {
         "Write all user-facing prose",
         "language of the user's latest request",
         "regardless of tool/repo text",
+        "Answer greetings and general questions",
+        "directly, without tools",
+        "do not inspect the workspace just to introduce yourself or list capabilities",
         "advice/reviews are read-only",
         "security, data, API, or deployment decision",
         "Keep file paths and shell commands inside the workspace",
@@ -314,8 +317,51 @@ fn base64_matches_known_vectors() {
 #[test]
 fn shell_output_for_ui_normalizes_lines_and_escapes_control_chars() {
     assert_eq!(
-        shell_output_for_ui("one\r\ntwo\t\x1b[31mred\x1b[0m"),
-        "one\ntwo    \\x1b[31mred\\x1b[0m"
+        shell_output_for_ui("one\r\ntwo\t\x1b[31mred\x1b[0m\rthree\x00\x07"),
+        "one\ntwo    red\nthree\\x00\\x07"
+    );
+}
+
+#[test]
+fn shell_output_for_ui_strips_ansi_without_losing_visible_text() {
+    for (input, expected) in [
+        ("\x1b[32;1mPath\x1b[0m", "Path"),
+        ("\x1b[2K\x1b[1GГотово", "Готово"),
+        ("\x1b]0;title\x07text", "text"),
+        (
+            "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
+            "link",
+        ),
+        ("\u{009b}31mred\u{009b}0m", "red"),
+        ("\u{009d}0;title\u{009c}text", "text"),
+        ("text\x1b[31", "text"),
+        ("\x1b[31\nnext", "\nnext"),
+        ("\x1b]unfinished\nnext", "\nnext"),
+        ("plain [32;1m text", "plain [32;1m text"),
+        ("text\x1b", "text\\x1b"),
+    ] {
+        assert_eq!(shell_output_for_ui(input), expected, "{input:?}");
+    }
+}
+
+#[test]
+fn shell_ui_summary_normalizes_before_selecting_lines() {
+    for (stdout, stderr) in [
+        ("", ""),
+        (" \r\n\t", "\r"),
+        ("\x1b[32m\x1b[0m", "\x1b]0;title\x07"),
+    ] {
+        assert_eq!(shell_ui_summary(stdout, stderr), "(no output)");
+    }
+    assert_eq!(
+        shell_ui_summary("\x1b[32mPath\x1b[0m\rnext", "\x1b[31merror\x1b[0m"),
+        "Path\nnext\nerror"
+    );
+    let stdout = format!("\x1b[31merror:\x1b[0m hidden\n{}", "ok\n".repeat(6));
+    let summary = shell_ui_summary(&stdout, "");
+    assert!(
+        summary.contains("[errors: 1 of 1]\nerror: hidden"),
+        "{summary}"
     );
 }
 

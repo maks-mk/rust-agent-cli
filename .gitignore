@@ -1,9 +1,5 @@
 sessions/
 target/
-desktop/node_modules/
-desktop/dist/
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
 .env
 __pycache__/
 

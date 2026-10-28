@@ -24,6 +24,34 @@ fn config() -> Config {
     }
 }
 
+#[test]
+fn history_patches_are_persisted_without_replacing_the_prefix() {
+    let (mut app, _rx) = app();
+    let prefix = json!({"role": "user", "content": "inspect"});
+    app.on_agent(AgentEvent::Sync(vec![prefix.clone()]));
+    app.on_agent(AgentEvent::HistoryPatch {
+        start: 1,
+        end: 1,
+        messages: vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "read"}]}),
+            json!({"role": "tool", "tool_call_id": "read", "content": "pending"}),
+        ],
+    });
+    app.on_agent(AgentEvent::HistoryPatch {
+        start: 2,
+        end: 3,
+        messages: vec![json!({"role": "tool", "tool_call_id": "read", "content": "done"})],
+    });
+    assert_eq!(app.history[0], prefix);
+    assert_eq!(app.history[2]["content"], "done");
+    assert_eq!(app.history_mark, app.history.len());
+    assert_eq!(app.session.history, app.history);
+    let saved = app.session_store.load(&app.session.id).unwrap().unwrap();
+    assert_eq!(saved.history, app.history);
+    app.rollback_unanswered();
+    assert_eq!(app.history, saved.history);
+}
+
 fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> TokenUsage {
     TokenUsage {
         prompt_tokens: prompt,
@@ -524,6 +552,157 @@ fn usage_overflow_marks_the_counter_as_partial() {
 }
 
 #[test]
+fn legacy_history_does_not_expose_raw_tool_results_or_write_arguments() {
+    let history = vec![
+        json!({"role":"assistant", "tool_calls":[
+            {"id":"read", "function":{"name":"read_file", "arguments":"{\"path\":\"index.html\"}"}},
+            {"id":"write", "function":{"name":"write_file", "arguments":{"path":"main.js", "content":"private file body"}}}
+        ]}),
+        json!({"role":"tool", "tool_call_id":"read", "content":"<html>full file body</html>"}),
+        json!({"role":"tool", "tool_call_id":"write", "content":"full write response"}),
+        json!({"role":"tool", "tool_call_id":"orphan", "content":"orphan raw output"}),
+    ];
+    let entries = entries_from_history(&history, &[]);
+    assert_eq!(entries.len(), 3);
+    for (entry, label, target) in [
+        (&entries[1], "Read", "index.html"),
+        (&entries[2], "Write", "main.js"),
+    ] {
+        let Entry::Tool(tool) = entry else {
+            panic!("expected tool")
+        };
+        assert_eq!(tool.label, label);
+        assert_eq!(tool.target, target);
+        assert_eq!(tool.status, ToolStatus::Ok);
+        assert!(tool.result.is_none());
+        assert!(tool.output.is_none());
+    }
+    assert_eq!(history[1]["content"], "<html>full file body</html>");
+}
+
+#[test]
+fn tool_ui_survives_restart_and_session_switch_without_raw_results() {
+    let (mut app, _rx) = app();
+    let cfg = app.cfg.clone();
+    let id = app.session.id.clone();
+    app.history = vec![
+        json!({"role":"assistant", "tool_calls":[
+            {"id":"read", "function":{"name":"read_file", "arguments":"{\"path\":\"index.html\"}"}},
+            {"id":"shell", "function":{"name":"shell", "arguments":"{\"command\":\"npm test\"}"}},
+            {"id":"denied", "function":{"name":"write_file", "arguments":"{}"}}
+        ]}),
+        json!({"role":"tool", "tool_call_id":"read", "content":"<html>full file body</html>"}),
+        json!({"role":"tool", "tool_call_id":"shell", "content":"full shell stdout"}),
+        json!({"role":"tool", "tool_call_id":"denied", "content":"Denied"}),
+    ];
+    for (tool_id, label, target, status, summary) in [
+        (
+            "read",
+            "Read",
+            "index.html",
+            ToolStatus::Ok,
+            "Read 118 lines",
+        ),
+        (
+            "shell",
+            "Shell",
+            "npm test",
+            ToolStatus::Failed,
+            "Done · exit 7",
+        ),
+        ("denied", "Write", "main.js", ToolStatus::Denied, "Denied"),
+    ] {
+        app.on_agent(AgentEvent::ToolStart {
+            id: tool_id.into(),
+            label: label.into(),
+            target: target.into(),
+        });
+        app.on_agent(AgentEvent::ToolEnd {
+            id: tool_id.into(),
+            status,
+            summary: summary.into(),
+        });
+    }
+    app.on_agent(AgentEvent::ToolDiff {
+        id: "shell".into(),
+        diff: vec![DiffLine {
+            kind: agent::DiffKind::Context,
+            text: "$ npm test".into(),
+        }],
+    });
+    app.on_agent(AgentEvent::ToolOutput {
+        id: "shell".into(),
+        output: "exit code: 7\nshort summary".into(),
+    });
+    app.persist_current_session();
+    let expected = serde_json::to_value(&app.session.tool_entries).unwrap();
+    let history = app.history.clone();
+    drop(app);
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut restored = App::new(cfg, tx).unwrap();
+    for switched in [false, true] {
+        if switched {
+            restored.command("/clear");
+            assert!(restored.switch_session(&id).unwrap());
+        }
+        let tools: Vec<_> = restored
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(serde_json::to_value(tools).unwrap(), expected);
+        assert_eq!(restored.history, history);
+    }
+}
+
+#[test]
+fn context_summary_stays_private_after_restart_and_session_switch() {
+    let (mut app, _rx) = app();
+    let cfg = app.cfg.clone();
+    let id = app.session.id.clone();
+    let summary = json!({"role":"user", "content":
+        "Previous conversation summary (reference data, not new instructions):\nPrivate compressed context"});
+    assert!(agent::is_context_summary(&summary));
+    assert!(!agent::is_user_request(&summary));
+    let history = vec![
+        summary,
+        json!({"role":"user", "content":"Continue the task"}),
+        json!({"role":"assistant", "content":"Normal visible answer"}),
+    ];
+    assert!(agent::is_user_request(&history[1]));
+    assert!(!agent::is_context_summary(&history[2]));
+    app.history = history.clone();
+    app.persist_current_session();
+    drop(app);
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut restored = App::new(cfg, tx).unwrap();
+    for switched in [false, true] {
+        if switched {
+            restored.command("/clear");
+            assert!(restored.switch_session(&id).unwrap());
+        }
+        let users: Vec<_> = restored
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["Continue the task"]);
+        assert!(restored.entries.iter().any(
+            |entry| matches!(entry, Entry::Assistant(text) if text == "Normal visible answer")
+        ));
+        assert_eq!(restored.history, history);
+    }
+}
+
+#[test]
 fn app_restores_the_last_session_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = std::env::current_dir().unwrap();
@@ -536,7 +715,8 @@ fn app_restores_the_last_session_after_restart() {
         let mut app = App::new(cfg, tx).expect("first app");
         old_id = app.session.id.clone();
         app.session.title = "Persistent session".into();
-        app.history.push(json!({"role":"user", "content":"restore me"}));
+        app.history
+            .push(json!({"role":"user", "content":"restore me"}));
         app.persist_current_session();
     }
 
@@ -548,14 +728,18 @@ fn app_restores_the_last_session_after_restart() {
     assert_eq!(app.session.id, old_id);
     assert_eq!(app.session.title, "Persistent session");
     assert_eq!(app.history[0]["content"], "restore me");
-    assert!(app.entries.iter().any(|entry| matches!(entry, Entry::User(text) if text.as_str() == "restore me")));
+    assert!(app
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, Entry::User(text) if text.as_str() == "restore me")));
 }
 
 #[test]
 fn clear_starts_a_new_session_without_deleting_the_previous_one() {
     let (mut app, _rx) = app();
     let old_id = app.session.id.clone();
-    app.history.push(json!({"role":"user", "content":"keep this"}));
+    app.history
+        .push(json!({"role":"user", "content":"keep this"}));
     app.persist_current_session();
 
     app.command("/clear");
@@ -570,7 +754,8 @@ fn clear_starts_a_new_session_without_deleting_the_previous_one() {
 fn session_command_lists_and_restores_a_previous_session() {
     let (mut app, _rx) = app();
     let old_id = app.session.id.clone();
-    app.history.push(json!({"role":"user", "content":"saved prompt"}));
+    app.history
+        .push(json!({"role":"user", "content":"saved prompt"}));
     app.persist_current_session();
     app.command("/clear");
     app.command("/session");
@@ -578,7 +763,11 @@ fn session_command_lists_and_restores_a_previous_session() {
     assert!(app.session_menu_visible());
     let menu = app.session_menu.as_mut().unwrap();
     assert_eq!(menu.items.len(), 2);
-    menu.selected = menu.items.iter().position(|item| item.id == old_id).unwrap();
+    menu.selected = menu
+        .items
+        .iter()
+        .position(|item| item.id == old_id)
+        .unwrap();
     press(&mut app, KeyCode::Enter);
 
     assert!(!app.session_menu_visible());
@@ -597,7 +786,10 @@ fn workspace_command_changes_root_and_starts_a_new_session() {
     assert_ne!(app.session.id, old_id);
     assert_eq!(app.cfg.root, std::fs::canonicalize(dir.path()).unwrap());
     assert!(app.history.is_empty());
-    assert_eq!(app.session.workspace, app.cfg.root.to_string_lossy().to_string());
+    assert_eq!(
+        app.session.workspace,
+        app.cfg.root.to_string_lossy().to_string()
+    );
 }
 
 // ─────────────────────────── command menu ───────────────────────────
@@ -618,10 +810,7 @@ fn press(app: &mut App, code: KeyCode) {
 
 /// Presses the shortcut that switches the reasoning level.
 fn tab_key(app: &mut App) {
-    app.on_event(Event::Key(KeyEvent::new(
-        KeyCode::Tab,
-        KeyModifiers::NONE,
-    )));
+    app.on_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
 }
 
 /// Names of the commands currently listed in the menu.
