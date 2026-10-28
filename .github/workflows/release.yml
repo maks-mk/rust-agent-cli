@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. v0.1.2)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then tag="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test all targets
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'rust-agent-package'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target\release\rust-agent.exe' $stage
+          Copy-Item '.env.example' $stage
+          Copy-Item 'mcp.json.example' (Join-Path $stage 'mcp.json')
+          Copy-Item 'packaging\start.bat' $stage
+          Copy-Item 'README.md' $stage
+          $zip = "rust-agent-cli-$env:TAG.zip"
+          Compress-Archive -Path @(
+            (Join-Path $stage 'rust-agent.exe'),
+            (Join-Path $stage '.env.example'),
+            (Join-Path $stage 'mcp.json'),
+            (Join-Path $stage 'start.bat'),
+            (Join-Path $stage 'README.md')
+          ) -DestinationPath $zip
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem $zip | Select-Object Name, Length
+
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-agent-windows-${{ steps.meta.outputs.tag }}
+          path: rust-agent-cli-${{ steps.meta.outputs.tag }}.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+        run: |
+          $release = gh release view $env:TAG --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ZIP --clobber
+            gh release edit $env:TAG --title "rust-agent $env:TAG"
+          } else {
+            gh release create $env:TAG $env:ZIP --title "rust-agent $env:TAG" --generate-notes
+          }
