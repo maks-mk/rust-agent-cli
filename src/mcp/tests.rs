@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn model_tool_schema_includes_loaded_mcp_tools() {
+    let mut mcp = McpManager::default();
+    let builtin_count = crate::agent::tools_schema(&mcp).as_array().unwrap().len();
+    mcp.tools.push(ToolBinding {
+        api_name: "mcp_test_lookup".into(),
+        server_key: "test".into(),
+        server_index: 0,
+        original_name: "lookup".into(),
+        description: "Test lookup".into(),
+        input_schema: json!({"type": "object"}),
+        read_only: true,
+    });
+    let schemas = crate::agent::tools_schema(&mcp);
+    let tools = schemas.as_array().unwrap();
+    assert_eq!(tools.len(), builtin_count + 1);
+    assert_eq!(tools.last().unwrap()["function"]["name"], "mcp_test_lookup");
+}
+
+#[test]
 fn only_boolean_read_only_grants_trust_and_prompt_hides_credentials() {
     for policy in [
         Value::Null,

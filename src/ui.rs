@@ -1547,12 +1547,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut right = Vec::new();
     if area.width >= 100 {
+        let tools = format!("Tools: {}  ", app.tool_count);
+        let model_width = (area.width as usize - 70).saturating_sub(tools.len());
+        right.push(Span::styled(tools, muted()));
         right.push(Span::styled(
-            fit(
-                &app.cfg.model,
-                (area.width as usize - 70).min(40),
-                glyphs().ellipsis,
-            ),
+            fit(&app.cfg.model, model_width.min(40), glyphs().ellipsis),
             muted(),
         ));
         right.push(Span::raw("  "));

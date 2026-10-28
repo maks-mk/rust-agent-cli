@@ -422,6 +422,7 @@ pub struct App {
     pub token_usage: ChatUsage,
     pub context_tokens: usize,
     pub context_limit: usize,
+    pub tool_count: usize,
     pub compressing_context: bool,
     task: Option<JoinHandle<()>>,
     cancelling: bool,
@@ -505,6 +506,9 @@ impl App {
             token_usage: ChatUsage::default(),
             context_tokens: 0,
             context_limit,
+            tool_count: agent::tools_schema(&McpManager::default())
+                .as_array()
+                .map_or(0, Vec::len),
             compressing_context: false,
             task: None,
             cancelling: false,
@@ -1391,6 +1395,7 @@ impl App {
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
+            AgentEvent::ToolCount(count) => self.tool_count = count,
             AgentEvent::CompletionStart => {
                 self.completion_text = None;
                 self.completion_reasoning = None;

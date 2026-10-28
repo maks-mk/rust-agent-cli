@@ -213,6 +213,8 @@ pub enum AgentEvent {
     CompletionStart,
     /// Remove only the visible output of the failed attempt before retrying.
     CompletionDiscard,
+    /// Number of tools available to the model, including loaded MCP tools.
+    ToolCount(usize),
     /// A chunk of assistant text.
     Text(String),
     /// A chunk of "reasoning" text (DeepSeek / OpenRouter style models).
@@ -460,7 +462,7 @@ fn system_prompt(cfg: &Config) -> String {
     )
 }
 
-fn tools_schema(mcp: &McpManager) -> Value {
+pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
     let mut schemas = json!([
         {
             "type": "function",
@@ -559,6 +561,7 @@ pub async fn run_turn(
         }
         tools_schema(&mcp)
     };
+    let _ = tx.send(AgentEvent::ToolCount(tools.as_array().map_or(0, Vec::len)));
     let system = json!({ "role": "system", "content": system_prompt(cfg) });
     let overhead = estimate_tokens(&system).saturating_add(estimate_tokens(&tools));
     let mut measured: Option<(usize, usize)> = None;

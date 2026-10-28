@@ -334,6 +334,25 @@ fn the_footer_shows_the_reasoning_level_next_to_the_model() {
 }
 
 #[test]
+fn footer_shows_updated_tool_count_to_the_left_of_the_model() {
+    let mut app = app();
+    let builtins = crate::agent::tools_schema(&crate::mcp::McpManager::default())
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(app.tool_count, builtins);
+    app.on_agent(AgentEvent::ToolCount(builtins + 3));
+    for width in [102, 120] {
+        let rows = render(&mut app, width, 20);
+        let footer = rows.last().unwrap();
+        assert!(
+            footer.contains(&format!("Tools: {}  test-model", builtins + 3)),
+            "{width}: {footer}"
+        );
+    }
+}
+
+#[test]
 fn narrow_footer_prioritizes_stop_and_denial_over_model_name() {
     let mut app = app();
     app.cfg.model = "a-very-long-model-name-that-must-not-overwrite-controls".into();
