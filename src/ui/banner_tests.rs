@@ -171,6 +171,20 @@ fn ascii_banner_is_borderless_and_has_pixel_wordmark() {
 }
 
 #[test]
+fn banner_hides_the_verbatim_folder_prefix() {
+    let cfg = config("demo", r"\\?\D:\t1");
+    let lines = banner_with_glyphs(&cfg, 80, glyphs_for(true));
+    let folder = lines
+        .iter()
+        .map(|(line, _)| text(line))
+        .find(|row| row.contains("folder"))
+        .expect("folder row");
+
+    assert!(folder.contains(r"D:\t1"), "unexpected folder row: {folder:?}");
+    assert!(!folder.contains(r"\\?\"), "verbatim prefix leaked: {folder:?}");
+}
+
+#[test]
 fn long_folder_keeps_its_tail() {
     let folder = format!("{}rust-agent", "目录/".repeat(40));
     let cfg = config(&"model-".repeat(20), &folder);

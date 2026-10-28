@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod background;
 mod mcp;
+mod session;
 #[cfg(any(windows, test))]
 mod terminal_input;
 mod ui;
@@ -51,8 +52,8 @@ ENVIRONMENT (or a .env file next to the executable):
                       initial auto-approval mode: on/off (default: off)
     RUST_AGENT_ASCII  set to 1 to force ASCII-only UI glyphs (default: Unicode)
 
-The agent can only read and write files inside the directory it was started in.
-Shell commands run in that directory and need your approval (see /auto).
+The agent reads and writes files inside the current workspace. Use /workspace <path>
+to switch workspace; shell commands run there and need approval (see /auto).
 ";
 
 /// Configuration files live next to the executable. When the binary is built

@@ -434,7 +434,7 @@ pub struct McpManager {
     servers: Vec<McpServer>,
     tools: Vec<ToolBinding>,
     warnings: Vec<String>,
-    snapshot: Option<(PathBuf, String)>,
+    snapshot: Option<(PathBuf, String, PathBuf)>,
     decisions: HashMap<String, bool>,
 }
 
@@ -466,7 +466,7 @@ impl McpManager {
                 return;
             }
         };
-        let snapshot = (path.clone(), text.clone());
+        let snapshot = (path.clone(), text.clone(), root.to_path_buf());
         if self.snapshot.as_ref() != Some(&snapshot) {
             self.shutdown().await;
             self.snapshot = Some(snapshot);

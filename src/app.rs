@@ -3,7 +3,8 @@
 
 use crate::agent::{self, AgentEvent, Approval, Config, DiffLine, TokenUsage, ToolStatus, Tx};
 use crate::mcp::McpManager;
-use crate::ui::ascii_mode;
+use crate::session::{self, Session, SessionStore, SessionSummary, UNTITLED};
+use crate::ui::{ascii_mode, display_path};
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use serde_json::{json, Value};
@@ -200,6 +201,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
     },
     CommandSpec {
+        name: "/session",
+        desc: "list or switch saved sessions",
+        arg: Some("[id]"),
+        aliases: &[],
+    },
+    CommandSpec {
+        name: "/workspace",
+        desc: "change workspace directory",
+        arg: Some("[path]"),
+        aliases: &[],
+    },
+    CommandSpec {
         name: "/help",
         desc: "show commands and key bindings",
         arg: None,
@@ -266,6 +279,12 @@ pub struct SlashMenu {
     pub selected: usize,
     /// Set when the user closes the menu with Esc.
     pub dismissed: bool,
+}
+
+/// Interactive selector opened by `/session`.
+pub struct SessionMenu {
+    pub items: Vec<SessionSummary>,
+    pub selected: usize,
 }
 
 // ──────────────────────────────────── app ───────────────────────────────────
@@ -386,6 +405,9 @@ pub struct App {
     completion_reasoning: Option<usize>,
     history: Vec<Value>,
     history_mark: usize,
+    session_store: SessionStore,
+    session: Session,
+    persistence_error: Option<String>,
 
     pub input: Input,
     input_history: Vec<String>,
@@ -405,6 +427,7 @@ pub struct App {
     pub pending: Option<Pending>,
     pending_queue: VecDeque<Pending>,
     pub slash: Option<SlashMenu>,
+    pub session_menu: Option<SessionMenu>,
     pub auto: Arc<AtomicBool>,
 
     pub scroll: usize,
@@ -422,10 +445,36 @@ impl App {
             .build()?;
         let context_limit = cfg.context_tokens;
         let auto_approve = cfg.auto_approve;
+        let (session_store, mut session, restored) = SessionStore::open(
+            &cfg.config_dir,
+            &cfg.root,
+            &cfg.model,
+            cfg.reasoning_effort.as_deref(),
+        )?;
+        if restored {
+            cfg.model = session.model.clone();
+            cfg.reasoning_effort = session.reasoning_effort.clone();
+            let stored_workspace = std::path::PathBuf::from(&session.workspace);
+            if stored_workspace.is_dir() {
+                cfg.root = stored_workspace;
+            } else {
+                session.workspace = cfg.root.to_string_lossy().into_owned();
+            }
+        }
         let (effort_levels, effort_index) =
             effort_cycle(&cfg.reasoning_efforts, cfg.reasoning_effort.as_deref());
         // The active level is the cycle entry it belongs to.
         cfg.reasoning_effort = effort_levels.get(effort_index).cloned().flatten();
+        session.model = cfg.model.clone();
+        session.reasoning_effort = cfg.reasoning_effort.clone();
+        session.workspace = cfg.root.to_string_lossy().into_owned();
+        session_store.save(&mut session)?;
+        session_store.activate(&session.id)?;
+        let history = session.history.clone();
+        let mut entries = entries_from_history(&history);
+        if restored {
+            entries.push(Entry::Notice(format!("Restored session: {}", session.title)));
+        }
         Ok(Self {
             cfg,
             effort_levels,
@@ -433,11 +482,14 @@ impl App {
             client,
             tx,
             mcp: Arc::new(tokio::sync::Mutex::new(McpManager::default())),
-            entries: vec![Entry::Banner],
+            entries,
             completion_text: None,
             completion_reasoning: None,
-            history: Vec::new(),
+            history,
             history_mark: 0,
+            session_store,
+            session,
+            persistence_error: None,
             input: Input::default(),
             input_history: Vec::new(),
             hist_pos: None,
@@ -455,6 +507,7 @@ impl App {
             pending: None,
             pending_queue: VecDeque::new(),
             slash: None,
+            session_menu: None,
             auto: Arc::new(AtomicBool::new(auto_approve)),
             scroll: 0,
             last_total: 0,
@@ -561,6 +614,29 @@ impl App {
             return;
         }
 
+        // The session selector captures navigation keys while it is open.
+        if self.session_menu_visible() {
+            match k.code {
+                KeyCode::Up => {
+                    self.session_move(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.session_move(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.session_accept();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.session_menu = None;
+                    return;
+                }
+                _ => self.session_menu = None,
+            }
+        }
+
         // The command menu captures the navigation keys while it is open.
         if self.slash_menu_visible() {
             match k.code {
@@ -573,7 +649,12 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => {
-                    self.slash_accept();
+                    // A fully typed command runs right away; only a prefix is completed.
+                    if self.exact_command() {
+                        self.submit();
+                    } else {
+                        self.slash_accept();
+                    }
                     return;
                 }
                 KeyCode::Esc => {
@@ -665,6 +746,7 @@ impl App {
         }
         self.effort_index = (self.effort_index + 1) % self.effort_levels.len();
         self.cfg.reasoning_effort = self.effort_levels[self.effort_index].clone();
+        self.persist_current_session();
     }
 
     /// The reasoning level shown in the footer, if one is active.
@@ -728,13 +810,180 @@ impl App {
 
     /// Whether the command menu is currently shown.
     pub fn slash_menu_visible(&self) -> bool {
-        // An approval prompt always takes precedence over the command menu.
-        if self.pending.is_some() {
+        // Session selection and approval prompts take precedence over command completion.
+        if self.pending.is_some() || self.session_menu.is_some() {
             return false;
         }
         self.slash
             .as_ref()
             .is_some_and(|m| !m.dismissed && !m.items.is_empty())
+    }
+
+    pub fn session_menu_visible(&self) -> bool {
+        self.pending.is_none() && self.session_menu.as_ref().is_some_and(|m| !m.items.is_empty())
+    }
+
+    pub fn active_session_id(&self) -> &str {
+        &self.session.id
+    }
+
+    fn session_move(&mut self, delta: i32) {
+        let Some(menu) = &mut self.session_menu else { return };
+        if menu.items.is_empty() {
+            return;
+        }
+        let len = menu.items.len() as i32;
+        menu.selected = ((menu.selected as i32 + delta).rem_euclid(len)) as usize;
+    }
+
+    fn session_accept(&mut self) {
+        let Some(menu) = self.session_menu.take() else { return };
+        let Some(item) = menu.items.get(menu.selected) else { return };
+        let id = item.id.clone();
+        match self.switch_session(&id) {
+            Ok(true) => {}
+            Ok(false) => self.entries.push(Entry::Error(format!("Session not found: {id}"))),
+            Err(error) => self.entries.push(Entry::Error(format!("Cannot switch session: {error:#}"))),
+        }
+    }
+
+    fn persist_current_session(&mut self) {
+        self.session.history = self.history.clone();
+        self.session.model = self.cfg.model.clone();
+        self.session.reasoning_effort = self.cfg.reasoning_effort.clone();
+        self.session.workspace = self.cfg.root.to_string_lossy().into_owned();
+        match self.session_store.save(&mut self.session) {
+            Ok(()) => self.persistence_error = None,
+            Err(error) => {
+                let message = format!("Session save failed: {error:#}");
+                if self.persistence_error.as_deref() != Some(message.as_str()) {
+                    self.entries.push(Entry::Warning(message.clone()));
+                }
+                self.persistence_error = Some(message);
+            }
+        }
+    }
+
+    fn create_fresh_session(&mut self, workspace: std::path::PathBuf, notice: Option<&str>) {
+        self.persist_current_session();
+        let previous_save_error = self.persistence_error.clone();
+        match self.session_store.new_session(
+            &workspace,
+            &self.cfg.model,
+            self.cfg.reasoning_effort.as_deref(),
+        ) {
+            Ok(mut session) => {
+                let mut notices = Vec::new();
+                let save_error = self.session_store.save(&mut session).err();
+                if let Some(error) = &save_error {
+                    notices.push(format!("Session save failed: {error:#}"));
+                }
+                if let Err(error) = self.session_store.activate(&session.id) {
+                    notices.push(format!("Cannot activate session: {error:#}"));
+                }
+                self.cfg.root = workspace;
+                self.session = session;
+                self.reset_conversation_state();
+                self.persistence_error = save_error.map(|error| format!("Session save failed: {error:#}"));
+                if let Some(message) = previous_save_error {
+                    self.entries.push(Entry::Warning(message));
+                }
+                for message in notices {
+                    self.entries.push(Entry::Warning(message));
+                }
+                if let Some(message) = notice {
+                    self.entries.push(Entry::Notice(message.into()));
+                }
+            }
+            Err(error) => self.entries.push(Entry::Error(format!("Cannot create session: {error:#}"))),
+        }
+    }
+
+    fn reset_conversation_state(&mut self) {
+        self.history.clear();
+        self.history_mark = 0;
+        self.token_usage = ChatUsage::default();
+        self.context_tokens = 0;
+        self.compressing_context = false;
+        self.completion_text = None;
+        self.completion_reasoning = None;
+        self.input_history.clear();
+        self.hist_pos = None;
+        self.draft.clear();
+        self.last_submit.clear();
+        self.entries.clear();
+        self.entries.push(Entry::Banner);
+        self.scroll = 0;
+        self.session_menu = None;
+        self.slash = None;
+        self.persistence_error = None;
+    }
+
+    fn switch_session(&mut self, id: &str) -> Result<bool> {
+        if id == self.session.id {
+            self.session_menu = None;
+            self.entries.push(Entry::Notice(format!(
+                "Already in session: {}",
+                self.session.title
+            )));
+            return Ok(true);
+        }
+
+        self.persist_current_session();
+        let previous_save_error = self.persistence_error.clone();
+        let Some(mut session) = self.session_store.load(id)? else {
+            return Ok(false);
+        };
+
+        let workspace = std::path::PathBuf::from(&session.workspace);
+        let workspace_warning = if workspace.is_dir() {
+            self.cfg.root = workspace;
+            None
+        } else {
+            let warning = format!(
+                "Workspace is missing: {}. Keeping current workspace {}.",
+                display_path(&session.workspace),
+                display_path(&self.cfg.root)
+            );
+            session.workspace = self.cfg.root.to_string_lossy().into_owned();
+            Some(warning)
+        };
+
+        self.session_store.activate(&session.id)?;
+        self.cfg.model = session.model.clone();
+        self.cfg.reasoning_effort = session.reasoning_effort.clone();
+        let (levels, index) =
+            effort_cycle(&self.cfg.reasoning_efforts, self.cfg.reasoning_effort.as_deref());
+        self.effort_levels = levels;
+        self.effort_index = index;
+        self.cfg.reasoning_effort = self.effort_levels.get(self.effort_index).cloned().flatten();
+        self.session = session;
+        self.reset_conversation_state();
+        self.history = self.session.history.clone();
+        self.entries = entries_from_history(&self.history);
+        if let Some(message) = workspace_warning {
+            self.entries.push(Entry::Warning(message));
+        }
+        if let Some(message) = previous_save_error {
+            self.entries.push(Entry::Warning(message));
+        }
+        self.entries.push(Entry::Notice(format!(
+            "Switched to session: {}",
+            self.session.title
+        )));
+        self.token_usage = ChatUsage::default();
+        self.context_tokens = 0;
+        self.persist_current_session();
+        Ok(true)
+    }
+
+    /// Whether the prompt contains exactly a command name or alias.
+    fn exact_command(&self) -> bool {
+        let text = self.input.text();
+        let text = text.trim();
+        COMMANDS
+            .iter()
+            .any(|command| command.name == text || command.aliases.contains(&text))
     }
 
     /// Moves the highlight inside the command menu.
@@ -859,9 +1108,13 @@ impl App {
         self.input_history.push(text.clone());
         self.entries.push(Entry::User(text.clone()));
         self.history_mark = self.history.len();
+        if self.session.title == UNTITLED {
+            self.session.title = session::title_from_prompt(&text);
+        }
         self.history
             .push(json!({ "role": "user", "content": text }));
         self.last_submit = text;
+        self.persist_current_session();
         self.start_run();
     }
 
@@ -899,22 +1152,52 @@ impl App {
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/exit" | "/quit" | "/q" => self.should_quit = true,
-            "/clear" => {
-                // A clean session: no leftover messages, counters or prompt state.
-                self.history.clear();
-                self.history_mark = 0;
-                self.token_usage = ChatUsage::default();
-                self.context_tokens = 0;
-                self.compressing_context = false;
-                self.completion_text = None;
-                self.completion_reasoning = None;
-                self.input_history.clear();
-                self.hist_pos = None;
-                self.draft.clear();
-                self.last_submit.clear();
-                self.entries.clear();
-                self.entries.push(Entry::Banner);
-                self.scroll = 0;
+            "/clear" => self.create_fresh_session(self.cfg.root.clone(), None),
+            "/session" => {
+                if arg.is_empty() || arg.eq_ignore_ascii_case("list") {
+                    match self.session_store.list() {
+                        Ok(items) if !items.is_empty() => {
+                            self.session_menu = Some(SessionMenu { items, selected: 0 });
+                            self.slash = None;
+                        }
+                        Ok(_) => self.entries.push(Entry::Notice("No saved sessions".into())),
+                        Err(error) => self.entries.push(Entry::Error(format!("Cannot list sessions: {error:#}"))),
+                    }
+                } else if arg.eq_ignore_ascii_case("new") {
+                    self.create_fresh_session(self.cfg.root.clone(), None);
+                } else {
+                    let id = arg.trim();
+                    match self.switch_session(id) {
+                        Ok(true) => {}
+                        Ok(false) => self.entries.push(Entry::Error(format!("Session not found: {id}"))),
+                        Err(error) => self.entries.push(Entry::Error(format!("Cannot switch session: {error:#}"))),
+                    }
+                }
+            }
+            "/workspace" => {
+                if arg.is_empty() {
+                    self.entries.push(Entry::Notice(format!(
+                        "Workspace: {}\nUsage: /workspace <directory>",
+                        display_path(&self.cfg.root)
+                    )));
+                } else {
+                    let unquoted = arg
+                        .strip_prefix('"')
+                        .and_then(|value| value.strip_suffix('"'))
+                        .or_else(|| arg.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+                        .unwrap_or(arg);
+                    let requested = std::path::PathBuf::from(unquoted);
+                    let candidate = if requested.is_absolute() {
+                        requested
+                    } else {
+                        self.cfg.root.join(requested)
+                    };
+                    match std::fs::canonicalize(&candidate) {
+                        Ok(path) if path.is_dir() => self.create_fresh_session(path, Some("Workspace changed; started a new session")),
+                        Ok(_) => self.entries.push(Entry::Error(format!("Workspace is not a directory: {}", display_path(&candidate)))),
+                        Err(error) => self.entries.push(Entry::Error(format!("Cannot access workspace {}: {error}", display_path(&candidate)))),
+                    }
+                }
             }
             "/model" => {
                 if arg.is_empty() {
@@ -924,6 +1207,7 @@ impl App {
                     self.cfg.model = arg.to_string();
                     self.entries
                         .push(Entry::Notice(format!("Model set to {arg}")));
+                    self.persist_current_session();
                 }
             }
             "/auto" => {
@@ -947,7 +1231,9 @@ impl App {
                     "Commands\n\
                      /model [name]  show or change the model\n\
                      /auto          toggle auto-approve for writes and shell commands\n\
-                     /clear         start a new conversation\n\
+                     /clear         start a new session in this workspace\n\
+                     /session       list or switch saved sessions\n\
+                     /workspace     show or change the workspace directory\n\
                      /exit          quit\n\
                      \n\
                      Type / to open the command menu {sep} {arrows} select, Enter complete, Esc dismiss\n\
@@ -1033,6 +1319,7 @@ impl App {
         self.cancelling = false;
         self.fail_open_tools("Interrupted");
         self.rollback_unanswered();
+        self.persist_current_session();
         self.entries.push(Entry::Notice("Interrupted".into()));
     }
 
@@ -1175,10 +1462,12 @@ impl App {
                     h.len()
                 };
                 self.history = h;
+                self.persist_current_session();
             }
             AgentEvent::Done(h) => {
                 self.compressing_context = false;
                 self.history = h;
+                self.persist_current_session();
                 self.token_usage.finish_turn();
                 if !self.cancelling {
                     self.running = false;
@@ -1201,9 +1490,95 @@ impl App {
                     self.fail_open_tools("Failed");
                     self.entries.push(Entry::Error(e));
                     self.rollback_unanswered();
+                    self.persist_current_session();
                 }
             }
         }
+    }
+}
+
+fn entries_from_history(history: &[Value]) -> Vec<Entry> {
+    let mut entries = vec![Entry::Banner];
+    for message in history {
+        match message.get("role").and_then(Value::as_str).unwrap_or("") {
+            "user" => {
+                let text = history_content_text(message.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    entries.push(Entry::User(text));
+                }
+            }
+            "assistant" => {
+                if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+                    if !reasoning.is_empty() {
+                        entries.push(Entry::Thinking(reasoning.to_string()));
+                    }
+                }
+                if let Some(content) = message.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        entries.push(Entry::Assistant(content.to_string()));
+                    }
+                }
+                if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for call in calls {
+                        let id = call.get("id").and_then(Value::as_str).unwrap_or("restored-tool").to_string();
+                        let function = call.get("function").unwrap_or(&Value::Null);
+                        let label = function.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+                        let target = match function.get("arguments") {
+                            Some(Value::String(value)) => value.clone(),
+                            Some(value) => value.to_string(),
+                            None => String::new(),
+                        };
+                        entries.push(Entry::Tool(ToolEntry {
+                            id,
+                            label,
+                            target,
+                            status: ToolStatus::Running,
+                            diff: Vec::new(),
+                            result: None,
+                            output: None,
+                        }));
+                    }
+                }
+            }
+            "tool" => {
+                let id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+                let result = history_content_text(message.get("content").unwrap_or(&Value::Null));
+                if let Some(tool) = entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Tool(tool) if tool.id == id => Some(tool),
+                    _ => None,
+                }) {
+                    tool.status = ToolStatus::Ok;
+                    tool.result = Some(result);
+                } else {
+                    entries.push(Entry::Notice(format!("Tool result ({id}): {result}")));
+                }
+            }
+            _ => {}
+        }
+    }
+    entries
+}
+
+fn history_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.as_str() {
+                    Some(text.to_string())
+                } else if part.get("type").and_then(Value::as_str) == Some("text") {
+                    part.get("text").and_then(Value::as_str).map(str::to_string)
+                } else if part.get("type").and_then(Value::as_str).is_some_and(|kind| kind.contains("image")) {
+                    Some("[image]".to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 

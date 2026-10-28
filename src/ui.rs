@@ -2,6 +2,7 @@
 
 use crate::agent::{Config, DiffKind, ToolStatus};
 use crate::app::{App, ChatUsage, Entry, COMMANDS};
+use crate::session::format_timestamp;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -25,6 +26,13 @@ const OK: Color = Color::Rgb(158, 206, 106);
 const ERR: Color = Color::Rgb(247, 118, 142);
 const WARN: Color = Color::Rgb(224, 175, 104);
 const MUTED: Color = Color::Rgb(151, 163, 184);
+/// Menus sit in the background, so they use a quieter palette than chat content.
+const MENU_BORDER: Color = Color::Rgb(70, 77, 88);
+const MENU_TITLE: Color = Color::Rgb(174, 183, 196);
+const MENU_COMMAND: Color = Color::Rgb(166, 180, 196);
+const MENU_MODEL: Color = Color::Rgb(130, 154, 174);
+const MENU_ACTIVE: Color = Color::Rgb(137, 160, 136);
+const MENU_SELECTION: Color = Color::Rgb(47, 53, 61);
 const CODE: Color = Color::Rgb(125, 207, 255);
 
 const SPINNER: [&str; 4] = ["─", "╱", "│", "╲"];
@@ -50,6 +58,20 @@ pub(crate) fn ascii_mode() -> bool {
     use std::sync::OnceLock;
     static ASCII: OnceLock<bool> = OnceLock::new();
     *ASCII.get_or_init(|| ascii_requested(std::env::var("RUST_AGENT_ASCII").ok().as_deref()))
+}
+
+/// Formats a filesystem path for display. Windows canonicalization adds a
+/// verbatim prefix (`\\?\`), which is noise in the UI; the underlying path used
+/// for file access keeps its original form.
+pub(crate) fn display_path(path: impl AsRef<std::path::Path>) -> String {
+    let raw = path.as_ref().to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    }
 }
 
 fn ascii_requested(value: Option<&str>) -> bool {
@@ -129,13 +151,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let status_h = u16::from(area.height > min_input + footer_h + usage_h);
     let input_h = input_h.min(area.height.saturating_sub(footer_h + usage_h + status_h));
 
-    // The command menu takes a band of its own above the status line.
-    let menu_items = app.slash.as_ref().map(|m| m.items.len()).unwrap_or(0);
+    // Command completion and the session selector share a menu band.
+    let session_menu = app.session_menu_visible();
+    let menu_items = if session_menu {
+        app.session_menu.as_ref().map(|m| m.items.len()).unwrap_or(0)
+    } else {
+        app.slash.as_ref().map(|m| m.items.len()).unwrap_or(0)
+    };
+    let menu_content_lines = if session_menu { menu_items.saturating_mul(2) } else { menu_items };
     let free = area
         .height
         .saturating_sub(status_h + input_h + usage_h + footer_h + 1);
-    let menu_h = if app.slash_menu_visible() && app.pending.is_none() && free >= 3 {
-        (menu_items as u16 + 2).min(free).min(12)
+    let menu_h = if (session_menu || app.slash_menu_visible()) && app.pending.is_none() && free >= 3 {
+        (menu_content_lines as u16 + 2).min(free).min(12)
     } else {
         0
     };
@@ -179,7 +207,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     draw_chat(f, app, chat);
     if let Some(rect) = menu_chunk {
-        draw_slash_menu(f, app, rect);
+        if session_menu {
+            draw_session_menu(f, app, rect);
+        } else {
+            draw_slash_menu(f, app, rect);
+        }
     }
     draw_status(f, app, pad_h(status_chunk));
     draw_input(f, app, input_chunk, &in_lines, cursor);
@@ -200,7 +232,7 @@ fn draw_slash_menu(f: &mut Frame, app: &App, area: Rect) {
             let cmd = &COMMANDS[i];
             let mut spans = vec![Span::styled(
                 cmd.name.to_string(),
-                fg(ACCENT).add_modifier(Modifier::BOLD),
+                fg(MENU_COMMAND).add_modifier(Modifier::BOLD),
             )];
             if let Some(arg) = cmd.arg {
                 spans.push(Span::styled(arg.to_string(), muted()));
@@ -217,15 +249,63 @@ fn draw_slash_menu(f: &mut Frame, app: &App, area: Rect) {
                 .border_type(BorderType::Rounded)
                 .title(Line::styled(
                     format!(" Commands /{} ", m.query),
-                    fg(ACCENT).add_modifier(Modifier::BOLD),
+                    fg(MENU_TITLE).add_modifier(Modifier::BOLD),
                 ))
                 .style(fg(TEXT).bg(SURFACE))
-                .border_style(fg(ACCENT)),
+                .border_style(fg(MENU_BORDER)),
         )
-        .highlight_style(fg(BACKGROUND).bg(ACCENT))
+        .highlight_style(fg(TEXT).bg(MENU_SELECTION))
         .highlight_symbol(glyphs().user);
     let mut state = ListState::default();
     state.select(Some(m.selected));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_session_menu(f: &mut Frame, app: &App, area: Rect) {
+    let Some(menu) = &app.session_menu else { return };
+    let items: Vec<ListItem> = menu
+        .items
+        .iter()
+        .map(|session| {
+            let active = session.id == app.active_session_id();
+            let marker = if active { "* " } else { "  " };
+            let title_style = if active {
+                fg(MENU_TITLE).add_modifier(Modifier::BOLD)
+            } else {
+                fg(TEXT).add_modifier(Modifier::BOLD)
+            };
+            let title = Line::from(vec![
+                Span::styled(marker, if active { fg(MENU_ACTIVE) } else { muted() }),
+                Span::styled(session.title.clone(), title_style),
+                Span::styled(format!("  {}", session.id), muted()),
+            ]);
+            let details = Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format_timestamp(&session.updated_at), muted()),
+                Span::styled("  ·  ", muted()),
+                Span::styled(session.model.clone(), fg(MENU_MODEL)),
+                Span::styled("  ·  ", muted()),
+                Span::styled(display_path(&session.workspace), muted()),
+            ]);
+            ListItem::new(vec![title, details])
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Line::styled(
+                    " Sessions  ·  ↑/↓ select  Enter switch  Esc close ",
+                    fg(MENU_TITLE).add_modifier(Modifier::BOLD),
+                ))
+                .style(fg(TEXT).bg(SURFACE))
+                .border_style(fg(MENU_BORDER)),
+        )
+        .highlight_style(fg(TEXT).bg(MENU_SELECTION))
+        .highlight_symbol(glyphs().user);
+    let mut state = ListState::default();
+    state.select(Some(menu.selected));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -608,10 +688,10 @@ fn pixel_wordmark(ascii: bool, available: usize) -> Option<Vec<Vec<Span<'static>
                     let gray = shade.min(208) as u8;
                     let color = Color::Rgb(gray, gray, gray);
                     let pixel = if ascii {
-                        if (x + y * 3) % 13 == 0 { "::" } else { "##" }
-                    } else if (x + y * 3) % 13 == 0 {
+                        if (x + y * 3).is_multiple_of(13) { "::" } else { "##" }
+                    } else if (x + y * 3).is_multiple_of(13) {
                         "▒▒"
-                    } else if (x * 2 + y) % 9 == 0 {
+                    } else if (x * 2 + y).is_multiple_of(9) {
                         "▓▓"
                     } else {
                         "██"
@@ -640,7 +720,7 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
         .next()
         .unwrap_or("")
         .to_string();
-    let cwd = cfg.root.display().to_string();
+    let cwd = display_path(&cfg.root);
 
     let padding = width.saturating_sub(2).saturating_div(2).min(2);
     let available = if g.ascii {
@@ -1454,7 +1534,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     ));
     let right = Line::from(right);
     let (left_area, right_area) = bar_areas(area, right.width());
-    let left = if app.slash_menu_visible() {
+    let left = if app.session_menu_visible() {
+        let up = if ascii_mode() { "Up" } else { "↑" };
+        let down = if ascii_mode() { "Down" } else { "↓" };
+        if left_area.width >= 30 {
+            format!("{up}/{down} select | Enter switch | Esc close")
+        } else {
+            "Enter switch | Esc close".to_string()
+        }
+    } else if app.slash_menu_visible() {
         let up = if ascii_mode() { "Up" } else { "↑" };
         let down = if ascii_mode() { "Down" } else { "↓" };
         if left_area.width >= 42 {

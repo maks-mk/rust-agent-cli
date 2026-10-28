@@ -7,6 +7,13 @@ use ratatui::Terminal;
 use std::path::PathBuf;
 
 fn config() -> Config {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let config_dir = std::env::temp_dir().join(format!(
+        "rust-agent-ui-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     Config {
         api_mode: crate::agent::ApiMode::Chat,
         base_url: "https://example.invalid/v1".into(),
@@ -14,7 +21,7 @@ fn config() -> Config {
         model: "test-model".into(),
         reasoning_effort: Some("high".into()),
         reasoning_efforts: vec!["low".into(), "high".into()],
-        config_dir: PathBuf::from("."),
+        config_dir,
         root: PathBuf::from("."),
         max_steps: crate::agent::DEFAULT_MAX_STEPS,
         context_tokens: crate::agent::DEFAULT_CONTEXT_TOKENS,
@@ -32,6 +39,41 @@ fn ascii_requires_explicit_one() {
             "unexpected ASCII mode for {value:?}"
         );
     }
+}
+
+#[test]
+fn display_path_hides_the_windows_verbatim_prefix() {
+    assert_eq!(display_path(r"\\?\D:\t1"), r"D:\t1");
+    assert_eq!(
+        display_path(r"\\?\UNC\server\share"),
+        r"\\server\share"
+    );
+    assert_eq!(display_path(r"D:\t1"), r"D:\t1");
+}
+
+#[test]
+fn session_menu_hides_the_verbatim_workspace_prefix() {
+    let mut app = app();
+    app.session_menu = Some(crate::app::SessionMenu {
+        items: vec![crate::session::SessionSummary {
+            id: "s1".into(),
+            title: "saved session".into(),
+            workspace: r"\\?\D:\t1".into(),
+            model: "test-model".into(),
+            updated_at: "2026-10-28T01:07:00Z".into(),
+        }],
+        selected: 0,
+    });
+
+    let rows = render(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains(r"D:\t1")),
+        "expected the readable workspace path: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains(r"\\?\")),
+        "expected no verbatim prefix: {rows:?}"
+    );
 }
 
 fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> TokenUsage {
@@ -626,7 +668,7 @@ fn the_command_menu_lists_the_available_commands() {
     let menu: Vec<&String> = rows.iter().filter(|r| r.contains("Commands /")).collect();
     assert_eq!(menu.len(), 1, "expected one menu header: {rows:?}");
 
-    for cmd in ["/model", "/auto", "/clear", "/help", "/exit"] {
+    for cmd in ["/model", "/auto", "/clear", "/session", "/workspace", "/help", "/exit"] {
         assert!(
             rows.iter().any(|r| r.contains(cmd)),
             "expected {cmd} in the menu: {rows:?}"
@@ -635,6 +677,29 @@ fn the_command_menu_lists_the_available_commands() {
     assert!(
         rows.iter().any(|r| r.contains("show or change the model")),
         "expected the description next to the command: {rows:?}"
+    );
+}
+
+#[test]
+fn enter_on_a_typed_session_command_shows_the_session_list() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = app();
+    app.input.set("/session");
+    app.sync_slash();
+    app.on_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+
+    let rows = render(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("Sessions")),
+        "expected the session list: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains(crate::session::UNTITLED)),
+        "expected the saved session entry: {rows:?}"
     );
 }
 

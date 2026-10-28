@@ -1,6 +1,6 @@
 [package]
 name = "rust-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A small terminal (TUI) coding agent for any OpenAI-compatible API"
 
@@ -14,6 +14,7 @@ futures-util = "0.3"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 ratatui = "0.29"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

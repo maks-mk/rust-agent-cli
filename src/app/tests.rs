@@ -2,6 +2,13 @@ use super::*;
 use std::path::PathBuf;
 
 fn config() -> Config {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let config_dir = std::env::temp_dir().join(format!(
+        "rust-agent-app-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     Config {
         api_mode: crate::agent::ApiMode::Chat,
         base_url: "https://example.invalid/v1".into(),
@@ -9,7 +16,7 @@ fn config() -> Config {
         model: "test-model".into(),
         reasoning_effort: None,
         reasoning_efforts: vec!["low".into(), "high".into()],
-        config_dir: PathBuf::from("."),
+        config_dir,
         root: PathBuf::from("."),
         max_steps: crate::agent::DEFAULT_MAX_STEPS,
         context_tokens: crate::agent::DEFAULT_CONTEXT_TOKENS,
@@ -516,6 +523,83 @@ fn usage_overflow_marks_the_counter_as_partial() {
     assert!(!app.token_usage.is_complete());
 }
 
+#[test]
+fn app_restores_the_last_session_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = std::env::current_dir().unwrap();
+    let mut cfg = config();
+    cfg.config_dir = dir.path().to_path_buf();
+    cfg.root = workspace.clone();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let old_id;
+    {
+        let mut app = App::new(cfg, tx).expect("first app");
+        old_id = app.session.id.clone();
+        app.session.title = "Persistent session".into();
+        app.history.push(json!({"role":"user", "content":"restore me"}));
+        app.persist_current_session();
+    }
+
+    let mut cfg = config();
+    cfg.config_dir = dir.path().to_path_buf();
+    cfg.root = workspace;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = App::new(cfg, tx).expect("restored app");
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.session.title, "Persistent session");
+    assert_eq!(app.history[0]["content"], "restore me");
+    assert!(app.entries.iter().any(|entry| matches!(entry, Entry::User(text) if text.as_str() == "restore me")));
+}
+
+#[test]
+fn clear_starts_a_new_session_without_deleting_the_previous_one() {
+    let (mut app, _rx) = app();
+    let old_id = app.session.id.clone();
+    app.history.push(json!({"role":"user", "content":"keep this"}));
+    app.persist_current_session();
+
+    app.command("/clear");
+
+    assert_ne!(app.session.id, old_id);
+    assert!(app.history.is_empty());
+    let previous = app.session_store.load(&old_id).unwrap().unwrap();
+    assert_eq!(previous.history.len(), 1);
+}
+
+#[test]
+fn session_command_lists_and_restores_a_previous_session() {
+    let (mut app, _rx) = app();
+    let old_id = app.session.id.clone();
+    app.history.push(json!({"role":"user", "content":"saved prompt"}));
+    app.persist_current_session();
+    app.command("/clear");
+    app.command("/session");
+
+    assert!(app.session_menu_visible());
+    let menu = app.session_menu.as_mut().unwrap();
+    assert_eq!(menu.items.len(), 2);
+    menu.selected = menu.items.iter().position(|item| item.id == old_id).unwrap();
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.session_menu_visible());
+    assert_eq!(app.session.id, old_id);
+    assert_eq!(app.history[0]["content"], "saved prompt");
+}
+
+#[test]
+fn workspace_command_changes_root_and_starts_a_new_session() {
+    let (mut app, _rx) = app();
+    let dir = tempfile::tempdir().unwrap();
+    let old_id = app.session.id.clone();
+    let command = format!("/workspace {}", dir.path().display());
+    app.command(&command);
+
+    assert_ne!(app.session.id, old_id);
+    assert_eq!(app.cfg.root, std::fs::canonicalize(dir.path()).unwrap());
+    assert!(app.history.is_empty());
+    assert_eq!(app.session.workspace, app.cfg.root.to_string_lossy().to_string());
+}
+
 // ─────────────────────────── command menu ───────────────────────────
 
 /// Types text into the prompt one key at a time.
@@ -555,7 +639,15 @@ fn a_leading_slash_opens_the_command_menu() {
     assert!(app.slash_menu_visible());
     assert_eq!(
         menu_names(&app),
-        vec!["/model", "/auto", "/clear", "/help", "/exit"]
+        vec![
+            "/model",
+            "/auto",
+            "/clear",
+            "/session",
+            "/workspace",
+            "/help",
+            "/exit"
+        ]
     );
 }
 
@@ -620,6 +712,28 @@ fn enter_completes_the_command_in_the_menu() {
     assert_eq!(app.input.text(), "/clear");
     assert!(!app.slash_menu_visible());
     assert_eq!(app.entries.len(), 1);
+}
+
+#[test]
+fn enter_runs_an_exactly_typed_command() {
+    let (mut app, _rx) = app();
+    let old_id = app.session.id.clone();
+    type_text(&mut app, "/clear");
+    press(&mut app, KeyCode::Enter);
+
+    assert_ne!(app.session.id, old_id);
+    assert!(app.input.text().is_empty());
+}
+
+#[test]
+fn enter_opens_the_session_list_for_an_exactly_typed_command() {
+    let (mut app, _rx) = app();
+    type_text(&mut app, "/session");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.session_menu_visible());
+    assert_eq!(app.session_menu.as_ref().unwrap().items.len(), 1);
+    assert!(app.input.text().is_empty());
 }
 
 #[test]
