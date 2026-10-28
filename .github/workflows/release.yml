@@ -44,6 +44,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package
+        id: package
         shell: pwsh
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -63,14 +64,14 @@ jobs:
             (Join-Path $stage 'start.bat'),
             (Join-Path $stage 'README.md')
           ) -DestinationPath $zip
-          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Get-ChildItem $zip | Select-Object Name, Length
 
       - name: Upload run artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-agent-windows-${{ steps.meta.outputs.tag }}
-          path: rust-agent-cli-${{ steps.meta.outputs.tag }}.zip
+          path: ${{ steps.package.outputs.zip }}
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -78,8 +79,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
-          ZIP: ${{ steps.meta.outputs.zip }}
+          ZIP: ${{ steps.package.outputs.zip }}
         run: |
+          if (-not (Test-Path $env:ZIP)) { throw "release archive $env:ZIP was not created" }
           $release = gh release view $env:TAG --json tagName 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:TAG $env:ZIP --clobber

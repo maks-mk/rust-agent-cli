@@ -44,7 +44,40 @@ pub struct SessionStore {
     // Fields drop in declaration order: join the writer before releasing the lock.
     writer: SessionWriter,
     // Keep the OS lock alive; the file must not be removed on close.
-    _lock: File,
+    _lock: StoreLock,
+}
+
+/// Owns the OS lock that guards a session store.
+///
+/// The lock is released explicitly on drop: closing the descriptor is not enough, because
+/// a process that inherited the descriptor keeps the lock alive until it closes its copy.
+struct StoreLock {
+    file: File,
+}
+
+impl StoreLock {
+    fn acquire(path: &Path, dir: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .context("cannot open session store lock")?;
+        file.try_lock().with_context(|| {
+            format!(
+                "cannot lock session store {}; another agent may already be using it",
+                dir.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 #[derive(Default)]
@@ -132,19 +165,7 @@ impl SessionStore {
         let dir = config_dir.join("sessions");
         fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create session directory {}", dir.display()))?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("store.lock"))
-            .context("cannot open session store lock")?;
-        lock.try_lock().with_context(|| {
-            format!(
-                "cannot lock session store {}; another agent may already be using it",
-                dir.display()
-            )
-        })?;
+        let lock = StoreLock::acquire(&dir.join("store.lock"), &dir)?;
         let store = Self {
             dir,
             _lock: lock,
@@ -394,6 +415,7 @@ mod tests {
     use tempfile::tempdir;
 
     const LOCK_PROBE_DIR: &str = "RUST_AGENT_TEST_LOCK_DIR";
+    const LOCK_PROBE_FREE: &str = "RUST_AGENT_TEST_LOCK_FREE";
 
     #[test]
     fn saves_and_restores_active_session() {
@@ -538,10 +560,18 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let error = SessionStore::open(&dir, &dir, "model", None)
-            .err()
-            .expect("another process must not acquire the store lock");
-        assert!(error.to_string().contains("cannot lock session store"));
+        let result = SessionStore::open(&dir, &dir, "model", None);
+        if std::env::var_os(LOCK_PROBE_FREE).is_some() {
+            assert!(
+                result.is_ok(),
+                "another process must acquire the lock after the owner released it"
+            );
+        } else {
+            let error = result
+                .err()
+                .expect("another process must not acquire the store lock");
+            assert!(error.to_string().contains("cannot lock session store"));
+        }
     }
 
     #[test]
@@ -551,6 +581,20 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "session::tests::store_lock_child_probe"])
             .env(LOCK_PROBE_DIR, dir.path().canonicalize().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn store_lock_is_released_for_another_process_after_drop() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, _, _) = SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session::tests::store_lock_child_probe"])
+            .env(LOCK_PROBE_DIR, dir.path().canonicalize().unwrap())
+            .env(LOCK_PROBE_FREE, "1")
             .status()
             .unwrap();
         assert!(status.success());
