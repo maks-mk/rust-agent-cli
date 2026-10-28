@@ -1,4 +1,5 @@
 # rust-agent
+<img width="1903" height="1009" alt="image" src="https://github.com/user-attachments/assets/883646cf-dd31-4cdc-9833-45208f17fde7" />
 
 Небольшой терминальный (TUI) агент на Rust для любого OpenAI-compatible API.
 Инструменты: `read_file`, `read_images`, `write_file`, `edit_file`, `shell` и внешние MCP-инструменты через `stdio` или Streamable HTTP. Ответы приходят потоком (SSE).
