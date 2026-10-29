@@ -650,6 +650,10 @@ async fn compression_is_private_syncs_history_and_preserves_parallel_tool_pairs(
     assert_eq!(&history[2..6], &original[3..7]);
     assert_eq!(history[6]["content"], "Final answer");
     let requests = api.requests().await;
+    assert_eq!(
+        requests[0]["messages"][0]["content"],
+        CONTEXT_COMPRESSION_PROMPT
+    );
     assert!(requests[0].get("tools").is_none());
     assert!(requests[1]["tools"].is_array());
     assert_eq!(
@@ -683,6 +687,75 @@ async fn compression_is_private_syncs_history_and_preserves_parallel_tool_pairs(
     assert_eq!(usages, 2);
     assert!(synced);
     assert!(sizes[1] < sizes[0]);
+}
+
+#[tokio::test]
+async fn compression_marks_lossy_boundaries_and_preserves_labels_on_recompression() {
+    let memories = [
+        "Recorded state and evidence\n[reported] Earlier results; checks unknown.",
+        "Recorded state and evidence\n[reported/prior-summary] [reported] Earlier results; checks unknown.",
+    ];
+    let mut api = MockApi::start(
+        memories
+            .iter()
+            .map(|text| sse(vec![delta(json!({"content":text}))]))
+            .collect(),
+    )
+    .await;
+    let mut original = long_history();
+    let latest_user = original.last().unwrap().clone();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    for expected in memories {
+        let compressed = compress_context(&reqwest::Client::new(), &api.cfg, &original, &tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(is_context_summary(&compressed[0]));
+        assert!(!is_user_request(&compressed[0]));
+        assert_eq!(compressed[1], latest_user);
+        let content = compressed[0]["content"].as_str().unwrap();
+        assert!(content.starts_with(CONTEXT_SUMMARY_PREFIX));
+        assert!(content
+            .contains("Context compressed: 2 history messages replaced by this lossy summary."));
+        assert!(content.contains("earlier messages, not fresh verification"));
+        assert!(content.contains("retained verbatim and may predate compression"));
+        assert!(content.ends_with(&format!("{expected}{CONTEXT_SUMMARY_END}")));
+        assert_eq!(content.matches(CONTEXT_SUMMARY_PREFIX).count(), 1);
+        assert_eq!(content.matches(CONTEXT_SUMMARY_END).count(), 1);
+
+        let responses = responses_input(&compressed);
+        assert_eq!(responses[0]["role"], "user");
+        assert_eq!(responses[0]["content"], content);
+        original = compressed;
+        original.extend([
+            json!({"role":"assistant", "content":"Further work; verification pending. ".repeat(100)}),
+            json!({"role":"assistant", "content":"Awaiting verification"}),
+        ]);
+    }
+
+    let requests = api.requests().await;
+    assert_eq!(requests.len(), 2);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request["messages"][0]["content"],
+            CONTEXT_COMPRESSION_PROMPT
+        );
+        assert!(request.get("tools").is_none());
+        let input: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(input["latest_user_request"], latest_user["content"]);
+        assert_eq!(
+            is_context_summary(&input["messages_to_summarize"][0]),
+            index == 1
+        );
+        if index == 1 {
+            assert!(input["messages_to_summarize"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(memories[0]));
+        }
+    }
 }
 
 #[tokio::test]
