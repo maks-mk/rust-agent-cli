@@ -649,7 +649,7 @@ fn tool_ui_survives_restart_and_session_switch_without_raw_results() {
     });
     app.on_agent(AgentEvent::ToolOutput {
         id: "shell".into(),
-        output: "exit code: 7\nshort summary".into(),
+        output: format!("exit code: 7\nhead{}tail", "中".repeat(3000)),
     });
     app.persist_current_session().unwrap();
     let expected = serde_json::to_value(&app.session.tool_entries).unwrap();
@@ -663,6 +663,26 @@ fn tool_ui_survives_restart_and_session_switch_without_raw_results() {
             restored.command("/clear");
             assert!(restored.switch_session(&id).unwrap());
         }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut restored))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("exit code: 7"));
+        assert!(screen.contains("output truncated"));
+        assert!(screen.contains("tail"));
+        assert!(screen.matches('中').count() < 1000);
+        assert_eq!(
+            serde_json::to_value(&restored.session.tool_entries).unwrap(),
+            expected
+        );
         let tools: Vec<_> = restored
             .entries
             .iter()

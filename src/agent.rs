@@ -2279,7 +2279,7 @@ fn shell_target(args: &Value) -> String {
 
 /// Severity of a command output line, guessed from its wording.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ShellLineKind {
+pub(crate) enum ShellLineKind {
     Error,
     Warning,
 }
@@ -2288,7 +2288,7 @@ enum ShellLineKind {
 ///
 /// The heuristic only looks for common English markers. It exists to pull the
 /// important lines out of a noisy output for the user, not to parse anything.
-fn classify_shell_line(line: &str) -> Option<ShellLineKind> {
+pub(crate) fn classify_shell_line(line: &str) -> Option<ShellLineKind> {
     const ERROR_MARKERS: &[&str] = &[
         "error",
         "err:",
