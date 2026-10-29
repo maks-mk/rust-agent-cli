@@ -1,5 +1,5 @@
 # rust-agent
-<img width="1166" height="876" alt="rust-agent v0.1.2 — терминальный агент" src="assets/tui.jpg" />
+<img width="1166" height="876" alt="rust-agent v0.1.3 — терминальный агент" src="assets/tui.jpg" />
 
 Небольшой терминальный (TUI) агент на Rust для любого OpenAI-compatible API.
 Инструменты: `read_file`, `read_images`, `write_file`, `edit_file`, `shell` и внешние MCP-инструменты через `stdio` или Streamable HTTP. Ответы приходят потоком (SSE).
@@ -38,11 +38,11 @@ Windows-сборки публикуются в [Releases](https://github.com/mak
 `mcp.json`, `start.bat` и README. Распакуй архив, переименуй `.env.example`
 в `.env` и настрой ключ API.
 
-Релиз создаётся автоматически: пуш тега `v*` (например, `v0.1.2`) запускает
-workflow `.github/workflows/release.yml`, который проверяет форматирование и
-линтер, прогоняет тесты, собирает бинарник с иконкой и прикрепляет архив к
-Releases. Сборку для произвольного тега можно запустить вручную через
-Actions → Release → Run workflow.
+Релиз создаётся автоматически: пуш тега `v*` (например, `v0.1.3`) запускает
+workflow `.github/workflows/release.yml`, который сверяет тег с версией в
+`Cargo.toml`, проверяет форматирование и линтер, прогоняет тесты, собирает
+бинарник с иконкой и прикрепляет архив к Releases. Сборку для произвольного
+тега можно запустить вручную через Actions → Release → Run workflow.
 
 Рабочая папка — текущая директория при запуске. Чтобы работать с другим проектом,
 перейди в его папку и запусти бинарник:

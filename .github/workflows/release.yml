@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build and publish (e.g. v0.1.2)'
+        description: 'Tag to build and publish (e.g. v0.1.3)'
         required: true
 
 permissions:
@@ -30,6 +30,20 @@ jobs:
           tag="${{ inputs.tag }}"
           if [ -z "$tag" ]; then tag="${GITHUB_REF#refs/tags/}"; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches crate version
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $crateVersion = ($meta.packages | Where-Object { $_.name -eq 'rust-agent' }).version
+          if (-not $crateVersion) { throw 'could not read the crate version from Cargo.toml' }
+          $expected = "v$crateVersion"
+          if ($env:TAG -ne $expected) {
+            throw "Tag $($env:TAG) does not match the crate version ($expected)"
+          }
+          Write-Host "Tag $($env:TAG) matches the crate version $crateVersion"
 
       - name: Check formatting
         run: cargo fmt --check
