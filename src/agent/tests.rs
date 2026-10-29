@@ -256,6 +256,8 @@ fn system_prompt_is_compact_and_covers_essential_policy() {
         "preserve unrelated work and conventions",
         "fix root causes minimally",
         "reuse existing dependencies",
+        "rely on the applied diff in the tool result",
+        "re-read only if it was truncated",
         "never for editing",
         "Even with auto-approve, confirm destructive or production actions explicitly",
         "run relevant tests",

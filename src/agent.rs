@@ -10,6 +10,7 @@ use chrono::Local;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use similar::{ChangeTag, TextDiff};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -50,6 +51,10 @@ pub fn api_mode_from_env() -> Result<ApiMode> {
 const MAX_READ_BYTES: usize = 100_000;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_DIFF_LINES: usize = 30;
+/// Applied diff returned to the model, independently of the short UI preview.
+const MAX_EDIT_DIFF_LINES: usize = 200;
+const MAX_EDIT_DIFF_BYTES: usize = 16_000;
+const EDIT_DIFF_TRUNCATION: &str = "[Diff truncated; the entire edit was applied. Use read_file with offset/limit to inspect omitted changes.]\n";
 /// Total budget for the command output handed to the model. Every stream keeps
 /// a head and a tail inside this budget, so the model still sees how the
 /// command ended instead of a cut-off middle.
@@ -449,7 +454,9 @@ fn system_prompt(cfg: &Config) -> String {
          * Use `rg --files` to locate files and `rg -n` with path/glob filters to search text; \
          read matched ranges. Fall back to native search only if rg is unavailable.\n\
          * Read before editing; preserve unrelated work and conventions; fix root causes \
-         minimally; prefer targeted edits and reuse existing dependencies.\n\
+         minimally; prefer targeted edits and reuse existing dependencies. After each edit, rely \
+         on the applied diff in the tool result; re-read only if it was truncated or the file \
+         state is uncertain.\n\
          * `shell` is for inspection, builds, and tests, never for editing. Even with \
          auto-approve, confirm destructive or production actions explicitly.\n\
          * Verify uncertain APIs against installed versions/official docs (Context7 if \
@@ -502,7 +509,7 @@ pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace exact text in an existing file. The old_string must match the file content exactly (including whitespace and indentation) and must be unique unless replace_all is true. Read the file with read_file first and copy old_string from that fresh output. Requires user approval.",
+                "description": "Replace exact text in an existing file. The old_string must match the file content exactly (including whitespace and indentation) and must be unique unless replace_all is true. Read the file with read_file first and copy old_string from that fresh output. Requires user approval. On success, returns the applied unified diff with line numbers and context, plus line-ending metadata. Large diffs are explicitly truncated; a complete diff needs no extra read_file just to confirm the edit.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1920,7 +1927,7 @@ async fn edit_file(
         old_text.replacen(old_string, new_string, 1)
     };
 
-    let (diff, added, removed) = full_diff(Some(&old_text), &new_text);
+    let (diff, _, _) = full_diff(Some(&old_text), &new_text);
     let review = file_review(&diff, Some(&old_text), &new_text);
     let diff = make_diff(diff);
     let _ = tx.send(AgentEvent::ToolDiff {
@@ -1964,10 +1971,14 @@ async fn edit_file(
         return fail(format!("cannot write {path}: {e:#}"));
     }
 
+    let (applied_diff, added, removed) = edit_file_diff(&old_text, &new_text);
     (
         ToolStatus::Ok,
         format!("Edited · {noun} · +{added} −{removed}"),
-        format!("Edited {rel}: replaced {noun} (+{added} −{removed} lines)."),
+        format!(
+            "Edited {rel}: replaced {noun} (+{added} −{removed} lines).\n{applied_diff}{}",
+            file_line_endings(Some(&old_text), &new_text),
+        ),
     )
 }
 
@@ -2724,6 +2735,75 @@ fn full_diff(old: Option<&str>, new: &str) -> (Vec<DiffLine>, usize, usize) {
     (out, added.len(), removed.len())
 }
 
+fn edit_file_diff(old: &str, new: &str) -> (String, usize, usize) {
+    // A deadline may produce a less minimal edit script, but never an invalid one.
+    let diff = TextDiff::configure()
+        .timeout(Duration::from_millis(200))
+        .diff_lines(old, new);
+    let (added, removed) = diff
+        .iter_all_changes()
+        .fold((0, 0), |(added, removed), change| match change.tag() {
+            ChangeTag::Insert => (added + 1, removed),
+            ChangeTag::Delete => (added, removed + 1),
+            ChangeTag::Equal => (added, removed),
+        });
+    let mut out = String::from("Applied diff (- old, + new; line numbers in @@ headers):\n");
+    let mut lines = 1;
+    let mut append = |prefix: &str, text: &str| {
+        let needs_newline = !text.ends_with('\n');
+        // Reserve room for the truncation notice without splitting a UTF-8 line.
+        if lines >= MAX_EDIT_DIFF_LINES - 1
+            || out.len() + prefix.len() + text.len() + usize::from(needs_newline)
+                > MAX_EDIT_DIFF_BYTES - EDIT_DIFF_TRUNCATION.len()
+        {
+            return false;
+        }
+        out.push_str(prefix);
+        out.push_str(text);
+        if needs_newline {
+            out.push('\n');
+        }
+        lines += 1;
+        true
+    };
+    let mut truncated = false;
+    let mut unified = diff.unified_diff();
+    unified.context_radius(2);
+    'hunks: for hunk in unified.iter_hunks() {
+        if !append("", &hunk.header().to_string()) {
+            truncated = true;
+            break;
+        }
+        for change in hunk.iter_changes() {
+            let prefix = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            if !append(prefix, change.value())
+                || (change.missing_newline() && !append("", "\\ No newline at end of file"))
+            {
+                truncated = true;
+                break 'hunks;
+            }
+        }
+    }
+    if truncated {
+        out.push_str(EDIT_DIFF_TRUNCATION);
+    }
+    (out, added, removed)
+}
+
+fn file_line_endings(old: Option<&str>, new: &str) -> String {
+    format!(
+        "Line endings: old CRLF={}, new CRLF={}; final newline: old={}, new={}",
+        old.unwrap_or_default().matches("\r\n").count(),
+        new.matches("\r\n").count(),
+        old.is_some_and(|text| text.ends_with('\n')),
+        new.ends_with('\n'),
+    )
+}
+
 fn file_review(diff: &[DiffLine], old: Option<&str>, new: &str) -> String {
     let mut review = String::from("Full diff (- removed, + added):\n");
     for line in diff {
@@ -2736,13 +2816,7 @@ fn file_review(diff: &[DiffLine], old: Option<&str>, new: &str) -> String {
         review.push_str(&line.text);
         review.push('\n');
     }
-    review.push_str(&format!(
-        "Line endings: old CRLF={}, new CRLF={}; final newline: old={}, new={}",
-        old.unwrap_or_default().matches("\r\n").count(),
-        new.matches("\r\n").count(),
-        old.is_some_and(|text| text.ends_with('\n')),
-        new.ends_with('\n'),
-    ));
+    review.push_str(&file_line_endings(old, new));
     review
 }
 

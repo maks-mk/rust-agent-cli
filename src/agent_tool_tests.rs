@@ -39,7 +39,9 @@ async fn file_approval_contains_full_diff_not_just_preview() {
                 _ => {}
             }
         }
-        assert_eq!(task.await.unwrap().0, ToolStatus::Denied);
+        let (status, _, content) = task.await.unwrap();
+        assert_eq!(status, ToolStatus::Denied);
+        assert!(!content.contains("Applied diff"));
         if tool == "create" {
             assert!(!path.exists());
         } else {
@@ -81,8 +83,9 @@ async fn approval_rejects_concurrent_writes_edits_deletion_and_creation() {
                     break;
                 }
             }
-            let (status, _, _) = task.await.unwrap();
+            let (status, _, content) = task.await.unwrap();
             assert_eq!(status, ToolStatus::Failed);
+            assert!(!content.contains("Applied diff"));
             if delete {
                 assert!(!path.exists());
             } else {
@@ -115,6 +118,219 @@ async fn approval_rejects_concurrent_writes_edits_deletion_and_creation() {
     assert_eq!(
         std::fs::read_to_string(api.cfg.root.join("new.txt")).unwrap(),
         ""
+    );
+}
+
+#[tokio::test]
+async fn edit_file_returns_applied_diff_with_context_and_line_numbers() {
+    let api = MockApi::start(vec![]).await;
+    let old = "first\nsecond\nold value\nfourth\nfifth\nsixth\n";
+    let new = old.replace("old value", "new value\nextra value");
+    std::fs::write(api.cfg.root.join("note.txt"), old).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (status, summary, content) = edit_file(
+        "edit",
+        &json!({"path":"note.txt", "old_string":"old value", "new_string":"new value\nextra value"}),
+        &api.cfg,
+        &tx,
+        &Arc::new(AtomicBool::new(true)),
+    )
+    .await;
+    assert_eq!(status, ToolStatus::Ok);
+    assert_eq!(summary, "Edited · 1 occurrence · +2 −1");
+    assert!(content.starts_with("Edited "));
+    assert!(
+        content.contains("note.txt: replaced 1 occurrence (+2 −1 lines)."),
+        "{content}"
+    );
+    assert!(content.contains("@@ -1,5 +1,6 @@\n first\n second\n-old value\n+new value\n+extra value\n fourth\n fifth\n"), "{content}");
+    assert!(!content.contains("sixth"));
+    assert!(!content.contains("Diff truncated"));
+    assert!(content.contains("final newline: old=true, new=true"));
+    assert_eq!(
+        std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
+        new
+    );
+    match rx.try_recv().unwrap() {
+        AgentEvent::ToolDiff { diff, .. } => assert!(diff.len() <= MAX_DIFF_LINES + 1),
+        _ => panic!("expected the existing UI diff preview"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn edit_file_replace_all_returns_separate_hunks_and_accurate_totals() {
+    let api = MockApi::start(vec![]).await;
+    let middle = (0..20).map(|i| format!("keep {i}\n")).collect::<String>();
+    let old = format!("before\nold\n{middle}old\nafter\n");
+    let new = old.replace("old", "new\nextra");
+    std::fs::write(api.cfg.root.join("note.txt"), &old).unwrap();
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let (status, summary, content) = edit_file(
+        "edit",
+        &json!({"path":"note.txt", "old_string":"old", "new_string":"new\nextra", "replace_all":true}),
+        &api.cfg,
+        &tx,
+        &Arc::new(AtomicBool::new(true)),
+    )
+    .await;
+    assert_eq!(status, ToolStatus::Ok);
+    assert_eq!(summary, "Edited · 2 occurrences · +4 −2");
+    assert_eq!(
+        content
+            .lines()
+            .filter(|line| line.starts_with("@@ "))
+            .count(),
+        2
+    );
+    assert!(content.contains("@@ -1,4 +1,5 @@"), "{content}");
+    assert!(content.contains("@@ -21,4 +22,5 @@"), "{content}");
+    assert!(!content.contains("keep 10"));
+    assert_eq!(content.matches("-old\n").count(), 2);
+    assert_eq!(content.matches("+new\n+extra\n").count(), 2);
+    assert_eq!(
+        std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
+        new
+    );
+}
+
+#[tokio::test]
+async fn edit_file_diff_handles_deletion_same_line_matches_unicode_crlf_and_eof() {
+    let api = MockApi::start(vec![]).await;
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    for (old, find, replacement, expected_diff, metadata) in [
+        ("remove\n", "remove\n", "", "@@ -1 +0,0 @@\n-remove\n", "final newline: old=true, new=false"),
+        ("first\nremove\nlast\n", "remove\n", "", "-remove\n last\n", "final newline: old=true, new=true"),
+        ("foo and foo", "foo", "bar", "-foo and foo\n\\ No newline at end of file\n+bar and bar\n\\ No newline at end of file", "final newline: old=false, new=false"),
+        ("привет\nмир", "мир", "world", "-мир\n\\ No newline at end of file\n+world\n", "final newline: old=false, new=false"),
+        ("one\r\ntwo\r\n", "two\r\n", "three\r\n", "-two\r\n+three\r\n", "old CRLF=2, new CRLF=2"),
+        ("one\r\n", "\r\n", "\n", "-one\r\n+one\n", "old CRLF=1, new CRLF=0"),
+        ("one", "one", "one\n", "-one\n\\ No newline at end of file\n+one\n", "final newline: old=false, new=true"),
+        ("one\n", "\n", "", "-one\n+one\n\\ No newline at end of file", "final newline: old=true, new=false"),
+        ("one\r\ntwo\nthree\r", "two", "changed", "-two\n+changed\n", "old CRLF=1, new CRLF=1"),
+    ] {
+        std::fs::write(api.cfg.root.join("note.txt"), old).unwrap();
+        let (status, _, content) = edit_file(
+            "edit",
+            &json!({"path":"note.txt", "old_string":find, "new_string":replacement, "replace_all":true}),
+            &api.cfg,
+            &tx,
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert_eq!(status, ToolStatus::Ok, "{content}");
+        assert!(content.contains(expected_diff), "{old:?}: {content}");
+        assert!(content.contains(metadata), "{old:?}: {content}");
+        assert!(!content.contains("Diff truncated"));
+        assert_eq!(std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(), old.replace(find, replacement));
+    }
+}
+
+#[tokio::test]
+async fn edit_file_truncates_diff_without_truncating_the_actual_edit() {
+    let api = MockApi::start(vec![]).await;
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    for (old, new) in [
+        (
+            "old\n".repeat(MAX_EDIT_DIFF_LINES + 20),
+            "new\n".repeat(MAX_EDIT_DIFF_LINES + 20),
+        ),
+        (
+            format!("{}\n", "я".repeat(MAX_EDIT_DIFF_BYTES)),
+            "new\n".to_string(),
+        ),
+    ] {
+        std::fs::write(api.cfg.root.join("note.txt"), &old).unwrap();
+        let (status, _, content) = edit_file(
+            "edit",
+            &json!({"path":"note.txt", "old_string":old, "new_string":new}),
+            &api.cfg,
+            &tx,
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert_eq!(status, ToolStatus::Ok);
+        assert!(content.contains(EDIT_DIFF_TRUNCATION));
+        let start = content.find("Applied diff").unwrap();
+        let end = content.find("Line endings:").unwrap();
+        let diff = &content[start..end];
+        assert!(diff.len() <= MAX_EDIT_DIFF_BYTES, "{} bytes", diff.len());
+        assert!(diff.lines().count() <= MAX_EDIT_DIFF_LINES);
+        assert_eq!(
+            std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
+            new
+        );
+    }
+}
+
+#[tokio::test]
+async fn edit_file_failures_do_not_claim_an_applied_diff() {
+    let api = MockApi::start(vec![]).await;
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    for args in [
+        json!({"path":"missing.txt", "old_string":"a", "new_string":"b"}),
+        json!({"path":"note.txt", "old_string":"missing", "new_string":"b"}),
+        json!({"path":"note.txt", "old_string":"test content", "new_string":"test content"}),
+        json!({"path":"note.txt", "old_string":"t", "new_string":"b"}),
+    ] {
+        let (status, _, content) = edit_file(
+            "edit",
+            &args,
+            &api.cfg,
+            &tx,
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(!content.contains("Applied diff"));
+        assert_eq!(
+            std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
+            "test content"
+        );
+    }
+}
+
+#[tokio::test]
+async fn edit_file_diff_reaches_the_next_model_request_without_an_extra_read() {
+    let mut api = MockApi::start(vec![
+        sse(vec![delta(json!({"tool_calls":[{"index":0, "id":"edit", "function":{"name":"edit_file", "arguments":"{\"path\":\"note.txt\",\"old_string\":\"test content\",\"new_string\":\"changed content\"}"}}]}))]),
+        sse(vec![delta(json!({"content":"Done"}))]),
+    ]).await;
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let history = run_turn(
+        &reqwest::Client::new(),
+        &api.cfg,
+        vec![json!({"role":"user", "content":"Edit note.txt"})],
+        &tx,
+        &Arc::new(AtomicBool::new(true)),
+        &Arc::new(tokio::sync::Mutex::new(McpManager::default())),
+    )
+    .await
+    .unwrap();
+    let requests = api.requests().await;
+    assert_eq!(requests.len(), 2);
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    let content = result["content"].as_str().unwrap();
+    assert!(
+        content.contains("-test content\n\\ No newline at end of file\n+changed content\n"),
+        "{content}"
+    );
+    assert_eq!(result["tool_call_id"], "edit");
+    assert!(history.contains(result));
+    let responses = responses_input(&history);
+    assert!(responses
+        .iter()
+        .any(|item| item["type"] == "function_call_output"
+            && item["call_id"] == "edit"
+            && item["output"] == content));
+    assert_eq!(
+        std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
+        "changed content"
     );
 }
 
