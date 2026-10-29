@@ -56,7 +56,6 @@ fn session_menu_hides_the_verbatim_workspace_prefix() {
             id: "s1".into(),
             title: "saved session".into(),
             workspace: r"\\?\D:\t1".into(),
-            model: "test-model".into(),
             updated_at: "2026-10-28T01:07:00Z".into(),
         }],
         selected: 0,

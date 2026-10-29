@@ -1,4 +1,4 @@
-use super::{load_env_file, pick_config_dir};
+use super::{config_dir, load_env_file, pick_config_dir};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -18,43 +18,114 @@ fn config_next_to_the_executable_wins() {
     let manifest = temp_config_dir("manifest");
     std::fs::write(exe.join(".env"), "OPENAI_MODEL=exe").unwrap();
     std::fs::write(manifest.join("mcp.json"), "{}").unwrap();
-    assert_eq!(pick_config_dir(Some(&exe), &manifest), exe);
+    assert_eq!(pick_config_dir(Some(&exe)).unwrap(), exe);
     let _ = std::fs::remove_dir_all(&exe);
     let _ = std::fs::remove_dir_all(&manifest);
 }
 
 #[test]
-fn source_checkout_is_used_when_the_executable_has_no_config() {
+fn source_checkout_is_ignored_when_the_executable_has_no_config() {
     let exe = temp_config_dir("empty-exe");
     let manifest = temp_config_dir("source");
     std::fs::write(manifest.join("mcp.json"), "{}").unwrap();
-    assert_eq!(pick_config_dir(Some(&exe), &manifest), manifest);
+    assert_eq!(pick_config_dir(Some(&exe)).unwrap(), exe);
     std::fs::write(manifest.join(".env"), "OPENAI_MODEL=source").unwrap();
-    assert_eq!(pick_config_dir(Some(&exe), &manifest), manifest);
+    assert_eq!(pick_config_dir(Some(&exe)).unwrap(), exe);
     let _ = std::fs::remove_dir_all(&exe);
     let _ = std::fs::remove_dir_all(&manifest);
 }
 
 #[test]
-fn env_file_is_loaded_from_the_config_directory() {
+fn env_file_overrides_inherited_variables() {
     let dir = temp_config_dir("env-load");
     std::fs::write(dir.join(".env"), "RUST_AGENT_CONFIG_PROBE=loaded\n").unwrap();
-    load_env_file(&dir);
+    let previous = std::env::var_os("RUST_AGENT_CONFIG_PROBE");
+    std::env::set_var("RUST_AGENT_CONFIG_PROBE", "inherited");
+    load_env_file(&dir).unwrap();
     assert_eq!(
         std::env::var("RUST_AGENT_CONFIG_PROBE").as_deref(),
         Ok("loaded")
     );
+    if let Some(previous) = previous {
+        std::env::set_var("RUST_AGENT_CONFIG_PROBE", previous);
+    } else {
+        std::env::remove_var("RUST_AGENT_CONFIG_PROBE");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn executable_directory_is_the_fallback() {
-    let exe = temp_config_dir("fallback-exe");
-    let manifest = temp_config_dir("fallback-manifest");
-    assert_eq!(pick_config_dir(Some(&exe), &manifest), exe);
-    assert_eq!(pick_config_dir(None, &manifest), manifest);
+fn executable_directory_is_used_without_config_files() {
+    let exe = temp_config_dir("empty-fallback-exe");
+    assert_eq!(pick_config_dir(Some(&exe)).unwrap(), exe);
+    assert!(pick_config_dir(None).is_err());
+    assert_eq!(
+        config_dir().unwrap(),
+        std::env::current_exe().unwrap().parent().unwrap()
+    );
     let _ = std::fs::remove_dir_all(&exe);
-    let _ = std::fs::remove_dir_all(&manifest);
+}
+
+#[test]
+fn missing_env_file_does_not_search_workspace_or_parents() {
+    const CONFIG_DIR_PROBE: &str = "RUST_AGENT_CONFIG_TEST_DIR";
+    const SEARCH_PROBE: &str = "RUST_AGENT_CONFIG_SEARCH_PROBE";
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_PROBE) {
+        load_env_file(Path::new(&dir)).unwrap();
+        assert!(std::env::var_os(SEARCH_PROBE).is_none());
+        return;
+    }
+
+    let dir = temp_config_dir("env-no-fallback");
+    let exe = dir.join("exe");
+    let source = dir.join("source");
+    let workspace = source.join("workspace");
+    std::fs::create_dir(&exe).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(source.join(".env"), format!("{SEARCH_PROBE}=parent\n")).unwrap();
+    std::fs::write(
+        workspace.join(".env"),
+        format!("{SEARCH_PROBE}=workspace\n"),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::missing_env_file_does_not_search_workspace_or_parents",
+            ])
+            .env(CONFIG_DIR_PROBE, &exe)
+            .env_remove(SEARCH_PROBE)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated env probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        if workspace.join(".env").exists() {
+            std::fs::remove_file(workspace.join(".env")).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_env_file_reports_an_error_without_secret_contents() {
+    let dir = temp_config_dir("invalid-env");
+    std::fs::write(
+        dir.join(".env"),
+        "SECRET_TEST_VALUE=\"private-test-marker\n",
+    )
+    .unwrap();
+    let error = load_env_file(&dir).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("invalid .env file"));
+    assert!(message.contains(&dir.display().to_string()));
+    assert!(!message.contains("private-test-marker"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Variables that come from the shell or the operating system instead of the

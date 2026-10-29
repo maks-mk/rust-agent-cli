@@ -8,7 +8,7 @@ mod session;
 mod terminal_input;
 mod ui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 const HELP: &str = "\
 rust-agent: a terminal coding agent for any OpenAI-compatible API
 
@@ -33,52 +33,42 @@ ENVIRONMENT (or a .env file next to the executable):
                       initial auto-approval mode: on/off (default: off)
     RUST_AGENT_ASCII  set to 1 to force ASCII-only UI glyphs (default: Unicode)
 
+.env is loaded only next to the executable and overrides inherited environment
+variables. Command-line flags take precedence over .env.
+
 The agent reads and writes files inside the current workspace. Use /workspace <path>
 to switch workspace; shell commands run there and need approval (see /auto).
 ";
 
-/// Configuration files live next to the executable. When the binary is built
-/// and run from source, the crate directory is used instead.
-fn config_dir() -> std::path::PathBuf {
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    pick_config_dir(exe_dir.as_deref(), &manifest)
+/// Configuration files and sessions live next to the executable.
+fn config_dir() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("cannot determine the executable path")?;
+    pick_config_dir(exe.parent())
 }
 
-/// Prefers a directory that actually holds a config file: the executable
-/// directory first, the crate directory second, the executable directory last.
-fn pick_config_dir(
-    exe_dir: Option<&std::path::Path>,
-    manifest: &std::path::Path,
-) -> std::path::PathBuf {
-    let has_config =
-        |dir: &std::path::Path| dir.join(".env").is_file() || dir.join("mcp.json").is_file();
-    if let Some(dir) = exe_dir.filter(|dir| has_config(dir)) {
-        return dir.to_path_buf();
-    }
-    if has_config(manifest) {
-        return manifest.to_path_buf();
-    }
-    exe_dir.unwrap_or(manifest).to_path_buf()
+fn pick_config_dir(exe_dir: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    exe_dir
+        .map(std::path::Path::to_path_buf)
+        .context("cannot determine the executable directory")
 }
 
-/// Loads `.env` from the config directory. Without one there, the previous
-/// behaviour applies: search the working directory and its parents.
-fn load_env_file(config_dir: &std::path::Path) {
+/// Loads only the executable-adjacent `.env`, overriding inherited variables.
+fn load_env_file(config_dir: &std::path::Path) -> Result<()> {
     let path = config_dir.join(".env");
-    if path.is_file() {
-        // Variables already set in the environment keep priority over the file.
-        let _ = dotenvy::from_path(&path);
-    } else {
-        let _ = dotenvy::dotenv();
+    match dotenvy::from_path_override(&path) {
+        Ok(()) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(dotenvy::Error::Io(error)) => {
+            Err(error).with_context(|| format!("cannot read .env file {}", path.display()))
+        }
+        // Parse errors can contain secrets from the file; do not display them.
+        Err(_) => bail!("invalid .env file {}; check its syntax", path.display()),
     }
 }
 
 fn load_config() -> Result<agent::Config> {
-    let config_dir = config_dir();
-    load_env_file(&config_dir);
+    let config_dir = config_dir()?;
+    load_env_file(&config_dir)?;
     let mut model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
     let mut base_url =
         std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
@@ -107,8 +97,9 @@ fn load_config() -> Result<agent::Config> {
     if api_key.is_empty() && base_url.contains("api.openai.com") {
         bail!(
             "OPENAI_API_KEY is not set.\n\
-             Put it in a .env file (OPENAI_API_KEY=sk-...) or set it in your shell.\n\
-             For other providers also set OPENAI_BASE_URL and OPENAI_MODEL."
+             Put it in the .env next to the executable ({}) or set it in your shell.\n\
+             For other providers also set OPENAI_BASE_URL and OPENAI_MODEL.",
+            config_dir.join(".env").display()
         );
     }
 

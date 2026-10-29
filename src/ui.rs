@@ -31,7 +31,6 @@ const MUTED: Color = Color::Rgb(151, 163, 184);
 const MENU_BORDER: Color = Color::Rgb(70, 77, 88);
 const MENU_TITLE: Color = Color::Rgb(174, 183, 196);
 const MENU_COMMAND: Color = Color::Rgb(166, 180, 196);
-const MENU_MODEL: Color = Color::Rgb(130, 154, 174);
 const MENU_ACTIVE: Color = Color::Rgb(137, 160, 136);
 const MENU_SELECTION: Color = Color::Rgb(47, 53, 61);
 const CODE: Color = Color::Rgb(125, 207, 255);
@@ -293,8 +292,6 @@ fn draw_session_menu(f: &mut Frame, app: &App, area: Rect) {
             let details = Line::from(vec![
                 Span::raw("    "),
                 Span::styled(format_timestamp(&session.updated_at), muted()),
-                Span::styled("  ·  ", muted()),
-                Span::styled(session.model.clone(), fg(MENU_MODEL)),
                 Span::styled("  ·  ", muted()),
                 Span::styled(display_path(&session.workspace), muted()),
             ]);

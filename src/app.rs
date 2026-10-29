@@ -450,14 +450,9 @@ impl App {
             .build()?;
         let context_limit = cfg.context_tokens;
         let auto_approve = cfg.auto_approve;
-        let (session_store, mut session, restored) = SessionStore::open(
-            &cfg.config_dir,
-            &cfg.root,
-            &cfg.model,
-            cfg.reasoning_effort.as_deref(),
-        )?;
+        let (session_store, mut session, restored) =
+            SessionStore::open(&cfg.config_dir, &cfg.root, cfg.reasoning_effort.as_deref())?;
         if restored {
-            cfg.model = session.model.clone();
             cfg.reasoning_effort = session.reasoning_effort.clone();
             let stored_workspace = std::path::PathBuf::from(&session.workspace);
             if stored_workspace.is_dir() {
@@ -470,7 +465,6 @@ impl App {
             effort_cycle(&cfg.reasoning_efforts, cfg.reasoning_effort.as_deref());
         // The active level is the cycle entry it belongs to.
         cfg.reasoning_effort = effort_levels.get(effort_index).cloned().flatten();
-        session.model = cfg.model.clone();
         session.reasoning_effort = cfg.reasoning_effort.clone();
         session.workspace = cfg.root.to_string_lossy().into_owned();
         session_store.save(&mut session)?;
@@ -899,7 +893,6 @@ impl App {
                 _ => None,
             })
             .collect();
-        self.session.model = self.cfg.model.clone();
         self.session.reasoning_effort = self.cfg.reasoning_effort.clone();
         self.session.workspace = self.cfg.root.to_string_lossy().into_owned();
     }
@@ -936,11 +929,9 @@ impl App {
             return;
         }
         let prepared = (|| -> Result<Session> {
-            let mut session = self.session_store.new_session(
-                &workspace,
-                &self.cfg.model,
-                self.cfg.reasoning_effort.as_deref(),
-            )?;
+            let mut session = self
+                .session_store
+                .new_session(&workspace, self.cfg.reasoning_effort.as_deref())?;
             self.session_store.save(&mut session)?;
             self.session_store.activate(&session.id)?;
             Ok(session)
@@ -1015,7 +1006,6 @@ impl App {
 
         self.session_store.activate(&session.id)?;
         self.cfg.root = workspace;
-        self.cfg.model = session.model.clone();
         self.cfg.reasoning_effort = session.reasoning_effort.clone();
         let (levels, index) = effort_cycle(
             &self.cfg.reasoning_efforts,

@@ -720,6 +720,60 @@ fn context_summary_stays_private_after_restart_and_session_switch() {
 }
 
 #[test]
+fn session_models_are_not_restored_or_persisted() {
+    let (mut app, _rx) = app();
+    let mut cfg = app.cfg.clone();
+    let previous_id = app.session.id.clone();
+    let previous_path = cfg
+        .config_dir
+        .join("sessions")
+        .join(format!("{previous_id}.json"));
+    let history = vec![json!({"role":"user", "content":"keep the previous conversation"})];
+    app.command("/model temporary-model");
+    assert_eq!(app.cfg.model, "temporary-model");
+    app.history = history.clone();
+    app.persist_current_session().unwrap();
+    drop(app);
+
+    let mut legacy: Value =
+        serde_json::from_slice(&std::fs::read(&previous_path).unwrap()).unwrap();
+    assert!(legacy.get("model").is_none());
+    legacy["model"] = json!("legacy-session-model");
+    std::fs::write(&previous_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    cfg.model = "configured-model".into();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut restored = App::new(cfg.clone(), tx).unwrap();
+    assert_eq!(restored.session.id, previous_id);
+    assert_eq!(restored.cfg.model, "configured-model");
+    assert_eq!(restored.history, history);
+    restored.command("/clear");
+    assert_eq!(restored.cfg.model, "configured-model");
+    assert!(restored.history.is_empty());
+    let fresh_id = restored.session.id.clone();
+    assert_ne!(fresh_id, previous_id);
+
+    restored.command("/model explicit-model");
+    assert_eq!(restored.cfg.model, "explicit-model");
+    assert!(restored.switch_session(&previous_id).unwrap());
+    assert_eq!(restored.cfg.model, "explicit-model");
+    assert_eq!(restored.history, history);
+    restored.command("/clear");
+    assert_eq!(restored.cfg.model, "explicit-model");
+    restored.persist_current_session().unwrap();
+    for id in [&previous_id, &fresh_id, &restored.session.id] {
+        let path = cfg.config_dir.join("sessions").join(format!("{id}.json"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.get("model").is_none());
+    }
+    drop(restored);
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let restarted = App::new(cfg, tx).unwrap();
+    assert_eq!(restarted.cfg.model, "configured-model");
+}
+
+#[test]
 fn app_restores_the_last_session_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = std::env::current_dir().unwrap();
@@ -758,7 +812,7 @@ fn failed_save_prevents_new_session_and_switch() {
     let old_root = app.cfg.root.clone();
     let mut target = app
         .session_store
-        .new_session(&old_root, "other-model", Some("high"))
+        .new_session(&old_root, Some("high"))
         .unwrap();
     app.session_store.save(&mut target).unwrap();
     let history = vec![json!({"role":"user", "content":"unsaved message"})];
@@ -800,7 +854,7 @@ fn failed_activation_preserves_workspace_and_conversation() {
     let old_effort = app.cfg.reasoning_effort.clone();
     let mut target = app
         .session_store
-        .new_session(dir.path(), "other-model", Some("high"))
+        .new_session(dir.path(), Some("high"))
         .unwrap();
     app.session_store.save(&mut target).unwrap();
     let history = vec![json!({"role":"user", "content":"keep this conversation"})];
@@ -827,7 +881,7 @@ fn failed_activation_preserves_workspace_and_conversation() {
     std::fs::remove_dir(blocked).unwrap();
     assert!(app.switch_session(&target.id).unwrap());
     assert_eq!(app.cfg.root, dir.path());
-    assert_eq!(app.cfg.model, "other-model");
+    assert_eq!(app.cfg.model, old_model);
 }
 
 #[test]

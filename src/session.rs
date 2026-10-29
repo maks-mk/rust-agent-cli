@@ -19,7 +19,6 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub workspace: String,
-    pub model: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub created_at: String,
@@ -35,7 +34,6 @@ pub struct SessionSummary {
     pub id: String,
     pub title: String,
     pub workspace: String,
-    pub model: String,
     pub updated_at: String,
 }
 
@@ -159,7 +157,6 @@ impl SessionStore {
     pub fn open(
         config_dir: &Path,
         workspace: &Path,
-        model: &str,
         reasoning_effort: Option<&str>,
     ) -> Result<(Self, Session, bool)> {
         let dir = config_dir.join("sessions");
@@ -190,18 +187,13 @@ impl SessionStore {
             return Ok((store, session, true));
         }
 
-        let mut session = store.new_session(workspace, model, reasoning_effort)?;
+        let mut session = store.new_session(workspace, reasoning_effort)?;
         store.save(&mut session)?;
         store.activate(&session.id)?;
         Ok((store, session, false))
     }
 
-    pub fn new_session(
-        &self,
-        workspace: &Path,
-        model: &str,
-        reasoning_effort: Option<&str>,
-    ) -> Result<Session> {
+    pub fn new_session(&self, workspace: &Path, reasoning_effort: Option<&str>) -> Result<Session> {
         let now = timestamp();
         let mut id = format!("s{}", Utc::now().timestamp_micros());
         let mut suffix = 1u32;
@@ -214,7 +206,6 @@ impl SessionStore {
             id,
             title: UNTITLED.into(),
             workspace: workspace.to_string_lossy().into_owned(),
-            model: model.into(),
             reasoning_effort: reasoning_effort.map(str::to_string),
             created_at: now.clone(),
             updated_at: now,
@@ -309,7 +300,6 @@ impl SessionStore {
                 id: session.id,
                 title: session.title,
                 workspace: session.workspace,
-                model: session.model,
                 updated_at: session.updated_at,
             });
         }
@@ -423,7 +413,7 @@ mod tests {
         let workspace = dir.path().join("project");
         fs::create_dir(&workspace).unwrap();
         let (store, mut session, restored) =
-            SessionStore::open(dir.path(), &workspace, "model-a", Some("high")).unwrap();
+            SessionStore::open(dir.path(), &workspace, Some("high")).unwrap();
         assert!(!restored);
         session.title = "Test session".into();
         session
@@ -433,28 +423,52 @@ mod tests {
 
         drop(store);
         let (store2, restored_session, restored) =
-            SessionStore::open(dir.path(), &workspace, "model-b", None).unwrap();
+            SessionStore::open(dir.path(), &workspace, None).unwrap();
         assert!(restored);
         assert_eq!(restored_session.id, session.id);
         assert_eq!(restored_session.title, "Test session");
-        assert_eq!(restored_session.model, "model-a");
         assert_eq!(restored_session.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(restored_session.history.len(), 1);
         assert_eq!(store2.list().unwrap().len(), 1);
     }
 
     #[test]
+    fn legacy_session_model_is_ignored_and_not_saved() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let (store, mut session, _) =
+            SessionStore::open(dir.path(), dir.path(), Some("high")).unwrap();
+        session.history = vec![serde_json::json!({"role":"user", "content":"keep history"})];
+        store.save(&mut session).unwrap();
+        let path = store.session_path(&session.id);
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        assert!(legacy.get("model").is_none());
+        legacy["model"] = serde_json::json!("legacy-model");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        drop(store);
+
+        let (store, mut restored, recovered) =
+            SessionStore::open(dir.path(), dir.path(), None).unwrap();
+        assert!(recovered);
+        assert_eq!(restored.id, session.id);
+        assert_eq!(restored.history, session.history);
+        assert_eq!(restored.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(store.list().unwrap().len(), 1);
+        store.save(&mut restored).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("model").is_none());
+        assert_eq!(saved["history"], legacy["history"]);
+    }
+
+    #[test]
     fn store_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
-        let error = SessionStore::open(dir.path(), dir.path(), "model", None)
+        let (store, session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
+        let error = SessionStore::open(dir.path(), dir.path(), None)
             .err()
             .expect("a second store must not acquire the lock");
         assert!(error.to_string().contains("cannot lock session store"));
         drop(store);
-        let (_store, restored, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (_store, restored, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         assert_eq!(restored.id, session.id);
     }
 
@@ -481,8 +495,7 @@ mod tests {
     #[tokio::test]
     async fn queued_saves_keep_latest_snapshot_and_report_completion() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, mut session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, mut session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         for revision in 0..100 {
             session.history = vec![serde_json::json!({"revision": revision})];
             store.queue_save(&mut session);
@@ -498,8 +511,7 @@ mod tests {
     #[test]
     fn explicit_save_follows_queued_snapshot() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, mut session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, mut session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         session.title = "queued".into();
         store.queue_save(&mut session);
         session.title = "explicit".into();
@@ -510,21 +522,18 @@ mod tests {
     #[test]
     fn drop_drains_queue_before_releasing_store_lock() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, mut session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, mut session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         session.title = "saved on drop".into();
         store.queue_save(&mut session);
         drop(store);
-        let (_store, restored, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (_store, restored, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         assert_eq!(restored.title, "saved on drop");
     }
 
     #[tokio::test]
     async fn failed_queued_save_preserves_previous_session_and_can_be_retried() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, mut session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, mut session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         let original = session.title.clone();
         let temp = store.session_path(&session.id).with_extension("tmp");
         fs::create_dir(&temp).unwrap();
@@ -541,15 +550,14 @@ mod tests {
     #[test]
     fn damaged_current_and_active_files_recover_backup() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, session, _) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, session, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         let path = store.session_path(&session.id);
         fs::copy(&path, backup_path(&path)).unwrap();
         fs::write(&path, b"broken JSON").unwrap();
         fs::write(store.dir.join("active.json"), b"broken pointer").unwrap();
         drop(store);
         let (_store, restored, recovered) =
-            SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+            SessionStore::open(dir.path(), dir.path(), None).unwrap();
         assert!(recovered);
         assert_eq!(restored.id, session.id);
     }
@@ -560,7 +568,7 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let result = SessionStore::open(&dir, &dir, "model", None);
+        let result = SessionStore::open(&dir, &dir, None);
         if std::env::var_os(LOCK_PROBE_FREE).is_some() {
             assert!(
                 result.is_ok(),
@@ -577,7 +585,7 @@ mod tests {
     #[test]
     fn store_lock_excludes_another_process() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (_store, _, _) = SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (_store, _, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "session::tests::store_lock_child_probe"])
             .env(LOCK_PROBE_DIR, dir.path().canonicalize().unwrap())
@@ -589,7 +597,7 @@ mod tests {
     #[test]
     fn store_lock_is_released_for_another_process_after_drop() {
         let dir = tempfile::tempdir_in("target").unwrap();
-        let (store, _, _) = SessionStore::open(dir.path(), dir.path(), "model", None).unwrap();
+        let (store, _, _) = SessionStore::open(dir.path(), dir.path(), None).unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "session::tests::store_lock_child_probe"])
