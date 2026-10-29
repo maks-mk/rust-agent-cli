@@ -432,9 +432,12 @@ pub struct App {
     pub session_menu: Option<SessionMenu>,
     pub auto: Arc<AtomicBool>,
 
+    pub rendered: crate::ui::HistoryState,
+    pub clear_terminal: bool,
     pub scroll: usize,
     pub last_total: usize,
     pub chat_height: usize,
+    pub capture_mouse: bool,
     pub tick: u64,
     pub should_quit: bool,
     last_ctrl_c: Option<Instant>,
@@ -517,9 +520,12 @@ impl App {
             slash: None,
             session_menu: None,
             auto: Arc::new(AtomicBool::new(auto_approve)),
+            rendered: crate::ui::HistoryState::default(),
+            clear_terminal: false,
             scroll: 0,
             last_total: 0,
-            chat_height: 10,
+            chat_height: 0,
+            capture_mouse: true,
             tick: 0,
             should_quit: false,
             last_ctrl_c: None,
@@ -538,16 +544,16 @@ impl App {
                     self.sync_slash();
                 }
             }
+            Event::Mouse(m) if self.pending.is_none() => match m.kind {
+                MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
+                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+                _ => {}
+            },
             Event::Resize(_, _) => {
                 if let Some(p) = &mut self.pending {
                     p.can_approve = false;
                 }
             }
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
-                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
-                _ => {}
-            },
             _ => {}
         }
     }
@@ -711,25 +717,23 @@ impl App {
             KeyCode::Home => self.input.home(),
             KeyCode::End if ctrl => self.scroll = 0,
             KeyCode::End => self.input.end(),
+            KeyCode::PageUp => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add(self.chat_height.saturating_sub(2).max(1))
+            }
+            KeyCode::PageDown => {
+                self.scroll = self
+                    .scroll
+                    .saturating_sub(self.chat_height.saturating_sub(2).max(1))
+            }
             KeyCode::Up => {
                 if !self.input.up() && !self.input.buf.contains(&'\n') {
                     self.history_prev();
                 }
             }
-            KeyCode::Down => {
-                if !self.input.down() && !self.input.buf.contains(&'\n') {
-                    self.history_next();
-                }
-            }
-            KeyCode::PageUp => {
-                self.scroll = self
-                    .scroll
-                    .saturating_add(self.chat_height.saturating_sub(2).max(1));
-            }
-            KeyCode::PageDown => {
-                self.scroll = self
-                    .scroll
-                    .saturating_sub(self.chat_height.saturating_sub(2).max(1));
+            KeyCode::Down if !self.input.down() && !self.input.buf.contains(&'\n') => {
+                self.history_next();
             }
             _ => {}
         }
@@ -968,9 +972,13 @@ impl App {
         self.hist_pos = None;
         self.draft.clear();
         self.last_submit.clear();
+        self.rendered = crate::ui::HistoryState::default();
+        self.clear_terminal = true;
+        self.scroll = 0;
+        self.last_total = 0;
         self.entries.clear();
         self.entries.push(Entry::Banner);
-        self.scroll = 0;
+
         self.session_menu = None;
         self.slash = None;
         self.persistence_error = None;
@@ -1019,6 +1027,7 @@ impl App {
         self.session = session;
         self.reset_conversation_state();
         self.history = self.session.history.clone();
+        self.rendered = crate::ui::HistoryState::default();
         self.entries = entries_from_history(&self.history, &self.session.tool_entries);
         if let Some(message) = workspace_warning {
             self.entries.push(Entry::Warning(message));
@@ -1181,7 +1190,6 @@ impl App {
         self.streamed_chars = 0;
         self.completion_text = None;
         self.completion_reasoning = None;
-        self.scroll = 0;
 
         let client = self.client.clone();
         let cfg = self.cfg.clone();
@@ -1316,9 +1324,8 @@ impl App {
                      Enter send {sep} \\ then Enter, Alt+Enter or Shift+Enter: new line\n\
                      Esc / Ctrl+C interrupt {sep} Ctrl+C twice or Ctrl+D quit\n\
                      {arrows} prompt history {sep} PgUp/PgDn / mouse wheel scroll\n\
-                     Ctrl+End jump to latest message\n\
-                     Tab switch the reasoning level\n\
-                     F2 toggle mouse scrolling / native text selection"
+                     Ctrl+End latest {sep} F2 toggle mouse capture / text selection\n\
+                     Tab switch the reasoning level"
                 )));
             }
             _ => {
@@ -1345,11 +1352,12 @@ impl App {
     }
 
     fn fail_open_tools(&mut self, why: &str) {
-        for e in self.entries.iter_mut() {
+        for (index, e) in self.entries.iter_mut().enumerate() {
             if let Entry::Tool(t) = e {
                 if matches!(t.status, ToolStatus::Running | ToolStatus::Waiting) {
                     t.status = ToolStatus::Failed;
                     t.result = Some(why.to_string());
+                    self.rendered.invalidate(index);
                 }
             }
         }
@@ -1406,10 +1414,21 @@ impl App {
     }
 
     fn tool_mut(&mut self, id: &str) -> Option<&mut ToolEntry> {
-        self.entries.iter_mut().rev().find_map(|e| match e {
-            Entry::Tool(t) if t.id == id => Some(t),
+        let index = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Tool(t) if t.id == id))?;
+        self.rendered.invalidate(index);
+        match &mut self.entries[index] {
+            Entry::Tool(t) => Some(t),
             _ => None,
-        })
+        }
+    }
+
+    pub(crate) fn streaming_entry(&self, index: usize) -> bool {
+        self.running
+            && (self.completion_text == Some(index)
+                || (self.completion_text.is_none() && self.completion_reasoning == Some(index)))
     }
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
@@ -1429,6 +1448,7 @@ impl App {
                 .collect();
                 indices.sort_unstable();
                 for index in indices.into_iter().rev() {
+                    self.rendered.remove(index);
                     if let Entry::Assistant(text) | Entry::Thinking(text) =
                         self.entries.remove(index)
                     {
@@ -1460,6 +1480,8 @@ impl App {
                 }
             }
             AgentEvent::ToolStart { id, label, target } => {
+                self.completion_text = None;
+                self.completion_reasoning = None;
                 self.entries.push(Entry::Tool(ToolEntry {
                     id,
                     label,
@@ -1544,6 +1566,8 @@ impl App {
                 self.autosave();
             }
             AgentEvent::Sync(h) => {
+                self.completion_text = None;
+                self.completion_reasoning = None;
                 self.history_mark = if h.last().is_some_and(agent::is_user_request) {
                     h.len().saturating_sub(1)
                 } else {

@@ -1,4 +1,4 @@
-use super::{load_env_file, pick_config_dir, should_capture_mouse};
+use super::{load_env_file, pick_config_dir};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -55,16 +55,6 @@ fn executable_directory_is_the_fallback() {
     assert_eq!(pick_config_dir(None, &manifest), manifest);
     let _ = std::fs::remove_dir_all(&exe);
     let _ = std::fs::remove_dir_all(&manifest);
-}
-
-#[test]
-fn modern_terminals_keep_mouse_capture() {
-    assert!(should_capture_mouse(true));
-}
-
-#[test]
-fn classic_windows_console_does_not_capture_mouse() {
-    assert_eq!(should_capture_mouse(false), !cfg!(windows));
 }
 
 /// Variables that come from the shell or the operating system instead of the

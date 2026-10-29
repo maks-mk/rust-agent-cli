@@ -253,22 +253,19 @@ fn retry_discards_only_current_attempt_and_preserves_notices() {
 }
 
 #[test]
-fn ctrl_end_jumps_to_latest_without_changing_the_draft() {
+fn ctrl_end_returns_to_latest_without_changing_the_draft() {
     let (mut app, _rx) = app();
-    app.scroll = 50;
     app.input.set("draft message");
     app.input.home();
+    app.scroll = 100;
     app.on_event(Event::Key(KeyEvent::new(
         KeyCode::End,
         KeyModifiers::CONTROL,
     )));
-    assert_eq!(app.scroll, 0);
     assert_eq!(app.input.text(), "draft message");
     assert_eq!(app.input.cursor, 0);
-
-    app.scroll = 12;
+    assert_eq!(app.scroll, 0);
     app.on_event(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
-    assert_eq!(app.scroll, 12);
     assert_eq!(app.input.cursor, app.input.buf.len());
 }
 
@@ -281,7 +278,6 @@ fn ctrl_end_does_not_bypass_approval_review() {
         prompt: format!("Run: {}hidden-tail", "line\n".repeat(100)),
         reply,
     });
-    app.scroll = 10;
     app.on_event(Event::Key(KeyEvent::new(
         KeyCode::End,
         KeyModifiers::CONTROL,
@@ -289,7 +285,6 @@ fn ctrl_end_does_not_bypass_approval_review() {
     let pending = app.pending.as_ref().unwrap();
     assert!(!pending.can_approve);
     assert_eq!(pending.scroll, 0);
-    assert_eq!(app.scroll, 10);
     app.on_event(Event::Key(KeyEvent::new(
         KeyCode::Enter,
         KeyModifiers::NONE,

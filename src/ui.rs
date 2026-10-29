@@ -1,4 +1,4 @@
-//! Rendering. Everything is drawn from `App` state each frame.
+//! Fullscreen rendering with cached history and a pinned input area.
 
 use crate::agent::{Config, DiffKind, ToolStatus};
 use crate::app::{App, ChatUsage, Entry, COMMANDS};
@@ -10,10 +10,11 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Pa
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-// Semantic colors on a fixed dark background keep contrast independent of the terminal theme.
-const BACKGROUND: Color = Color::Rgb(0, 0, 0);
+// Inherit the terminal palette outside deliberately shaded controls.
+#[cfg(test)]
+const BACKGROUND: Color = Color::Reset;
 const SURFACE: Color = Color::Rgb(30, 30, 30);
-const TEXT: Color = Color::Rgb(220, 225, 235);
+const TEXT: Color = Color::Reset;
 const BORDER: Color = Color::Rgb(80, 80, 80);
 const ACCENT: Color = Color::Rgb(187, 154, 247);
 const USER: Color = Color::Rgb(125, 190, 255);
@@ -126,7 +127,7 @@ fn muted() -> Style {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    f.render_widget(Block::default().style(fg(TEXT).bg(BACKGROUND)), area);
+    f.render_widget(Block::default().style(fg(TEXT)), area);
 
     let text_w = (area.width as usize).saturating_sub(4).max(1);
     let (in_lines, cursor) = layout_input(&app.input.buf, app.input.cursor, text_w);
@@ -259,10 +260,10 @@ fn draw_slash_menu(f: &mut Frame, app: &App, area: Rect) {
                     format!(" Commands /{} ", m.query),
                     fg(MENU_TITLE).add_modifier(Modifier::BOLD),
                 ))
-                .style(fg(TEXT).bg(SURFACE))
+                .style(fg(USER_TEXT).bg(SURFACE))
                 .border_style(fg(MENU_BORDER)),
         )
-        .highlight_style(fg(TEXT).bg(MENU_SELECTION))
+        .highlight_style(fg(USER_TEXT).bg(MENU_SELECTION))
         .highlight_symbol(glyphs().user);
     let mut state = ListState::default();
     state.select(Some(m.selected));
@@ -309,10 +310,10 @@ fn draw_session_menu(f: &mut Frame, app: &App, area: Rect) {
                     " Sessions  ·  ↑/↓ select  Enter switch  Esc close ",
                     fg(MENU_TITLE).add_modifier(Modifier::BOLD),
                 ))
-                .style(fg(TEXT).bg(SURFACE))
+                .style(fg(USER_TEXT).bg(SURFACE))
                 .border_style(fg(MENU_BORDER)),
         )
-        .highlight_style(fg(TEXT).bg(MENU_SELECTION))
+        .highlight_style(fg(USER_TEXT).bg(MENU_SELECTION))
         .highlight_symbol(glyphs().user);
     let mut state = ListState::default();
     state.select(Some(menu.selected));
@@ -331,24 +332,20 @@ fn pad_h(r: Rect) -> Rect {
 // ─────────────────────────────────── chat ───────────────────────────────────
 
 fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width as usize;
+    let mut cache = std::mem::take(&mut app.rendered);
+    cache.update(app, area.width as usize);
+    let total = cache.lines.len();
     let height = area.height as usize;
-
-    let lines = build_chat_lines(app, width);
-    let total = lines.len();
-
-    // Keep the viewport still while the user is scrolled up and new text arrives.
     if app.scroll > 0 && total > app.last_total {
-        app.scroll += total - app.last_total;
+        app.scroll = app.scroll.saturating_add(total - app.last_total);
     }
     app.last_total = total;
-    app.scroll = app.scroll.min(total.saturating_sub(height));
     app.chat_height = height;
-
-    let end = total - app.scroll;
+    app.scroll = app.scroll.min(total.saturating_sub(height));
+    let end = total.saturating_sub(app.scroll);
     let start = end.saturating_sub(height);
-    // Render lines directly so their background fills the entire message row.
-    for (row, line) in lines[start..end].iter().enumerate() {
+    cache.drawn_rows = end - start;
+    for (row, line) in cache.lines[start..end].iter().enumerate() {
         f.render_widget(
             line.clone(),
             Rect {
@@ -358,43 +355,123 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
     }
+    app.rendered = cache;
 }
 
+#[derive(Default)]
+pub struct HistoryState {
+    width: Option<usize>,
+    lines: Vec<Line<'static>>,
+    starts: Vec<usize>,
+    dynamic: std::collections::BTreeSet<usize>,
+    dirty_from: Option<usize>,
+    running_tools: bool,
+    drawn_rows: usize,
+    formatted_entries: usize,
+}
+
+impl HistoryState {
+    pub fn invalidate(&mut self, index: usize) {
+        self.dirty_from = Some(self.dirty_from.map_or(index, |old| old.min(index)));
+    }
+
+    pub fn remove(&mut self, index: usize) {
+        self.invalidate(index);
+    }
+
+    pub fn has_running_tool(&self) -> bool {
+        self.running_tools
+    }
+    pub fn drawn_rows(&self) -> usize {
+        self.drawn_rows
+    }
+    pub fn formatted_entries(&self) -> usize {
+        self.formatted_entries
+    }
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn update(&mut self, app: &App, width: usize) {
+        let mut first = self.starts.len().min(app.entries.len());
+        if self.width != Some(width) {
+            first = 0;
+        }
+        if let Some(index) = self.dirty_from.take() {
+            first = first.min(index);
+        }
+        if let Some(&index) = self.dynamic.first() {
+            first = first.min(index);
+        }
+        let row = self.starts.get(first).copied().unwrap_or(self.lines.len());
+        self.lines.truncate(row);
+        self.starts.truncate(first);
+        self.dynamic.retain(|&index| index < first);
+        self.width = Some(width);
+        self.formatted_entries = 0;
+        let spin_set = if ascii_mode() {
+            &SPINNER_ASCII
+        } else {
+            &SPINNER
+        };
+        let spin = spin_set[app.tick as usize % spin_set.len()];
+        for index in first..app.entries.len() {
+            let entry = &app.entries[index];
+            self.starts.push(self.lines.len());
+            let active = app.streaming_entry(index);
+            if active
+                || matches!(entry, Entry::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Waiting))
+            {
+                self.dynamic.insert(index);
+            }
+            if needs_gap(index.checked_sub(1).map(|i| &app.entries[i]), entry) {
+                self.lines.push(Line::default());
+            }
+            self.lines
+                .extend(entry_lines(app, entry, active, spin, width, false));
+            self.formatted_entries += 1;
+        }
+        self.running_tools = self
+            .dynamic
+            .iter()
+            .any(|&i| matches!(&app.entries[i], Entry::Tool(t) if t.status == ToolStatus::Running));
+    }
+}
+
+#[cfg(test)]
 fn build_chat_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let spin_set: &[&str] = if ascii_mode() {
-        &SPINNER_ASCII
-    } else {
-        &SPINNER
-    };
-    let spin = spin_set[(app.tick as usize) % spin_set.len()];
+    let mut cache = HistoryState::default();
+    cache.update(app, width);
+    cache.lines
+}
+fn entry_lines(
+    app: &App,
+    entry: &Entry,
+    active: bool,
+    spin: &str,
+    width: usize,
+    continuation: bool,
+) -> Vec<Line<'static>> {
     let g = glyphs();
     let bar_width = g.user_bar.chars().map(cw).sum::<usize>();
-    let n = app.entries.len();
-
-    for (i, e) in app.entries.iter().enumerate() {
-        let prev = if i > 0 {
-            Some(&app.entries[i - 1])
-        } else {
-            None
-        };
-        if needs_gap(prev, e) {
-            out.push(Line::from(""));
+    let show_bar = matches!(entry, Entry::User(_)) && width > bar_width;
+    let content_width = if show_bar { width - bar_width } else { width };
+    let mut out = Vec::new();
+    for (row, (mut line, hang)) in render_entry(app, entry, active, spin, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        if continuation && row == 0 && matches!(entry, Entry::Assistant(_)) {
+            line.spans[0] = Span::raw("  ");
         }
-        let is_user = matches!(e, Entry::User(_));
-        let show_bar = is_user && width > bar_width;
-        let content_width = if show_bar { width - bar_width } else { width };
-        let is_last = i + 1 == n;
-        for (line, hang) in render_entry(app, e, is_last, spin, content_width) {
-            let mut wrapped = wrap_line(&line, content_width, hang);
-            if show_bar {
-                let bar = Span::styled(g.user_bar, fg(USER_BAR).bg(SURFACE));
-                for line in &mut wrapped {
-                    line.spans.insert(0, bar.clone());
-                }
+        let mut wrapped = wrap_line(&line, content_width, hang);
+        if show_bar {
+            let bar = Span::styled(g.user_bar, fg(USER_BAR).bg(SURFACE));
+            for line in &mut wrapped {
+                line.spans.insert(0, bar.clone());
             }
-            out.extend(wrapped);
         }
+        out.extend(wrapped);
     }
     out
 }
@@ -440,7 +517,7 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
             let gutter_width = prefix.chars().map(cw).sum::<usize>();
             // Tables are laid out for the space that is left next to the gutter.
             let mut md = render_md(text.trim_end(), width.saturating_sub(gutter_width));
-            if is_last && app.running {
+            if is_last {
                 if let Some((spans, _)) = md.last_mut() {
                     spans.push(Span::styled(g.block, fg(ACCENT)));
                 }
@@ -459,7 +536,7 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
         Entry::Thinking(text) => {
             let g = glyphs();
             let style = muted().add_modifier(Modifier::ITALIC);
-            if is_last && app.running {
+            if is_last {
                 let ls: Vec<&str> = text.trim().lines().collect();
                 let tail = &ls[ls.len().saturating_sub(3)..];
                 for (i, l) in tail.iter().enumerate() {
@@ -1552,7 +1629,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     right.push(Span::styled(
         badge,
         if auto {
-            fg(BACKGROUND).bg(WARN).add_modifier(Modifier::BOLD)
+            fg(Color::Black).bg(WARN).add_modifier(Modifier::BOLD)
         } else {
             fg(READ).bg(SURFACE)
         },
@@ -1589,12 +1666,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     } else if app.running {
         if left_area.width >= 37 {
-            "Esc stop | Ctrl+End latest | F2 select".to_string()
+            "Esc stop | PgUp/PgDn scroll | F2 mouse".to_string()
         } else {
             "Esc stop".to_string()
         }
     } else if left_area.width >= 53 {
         "enter send | Shift+Enter newline | /help | F2 select".to_string()
+    } else if left_area.width >= 29 {
+        "enter send | /help | F2 select".to_string()
     } else if left_area.width >= 19 {
         "enter send | /help".to_string()
     } else {
@@ -1685,7 +1764,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect, lines: &[String], cursor
                 approval_title,
                 fg(WARN).add_modifier(Modifier::BOLD),
             ))
-            .style(fg(TEXT).bg(SURFACE))
+            .style(fg(USER_TEXT).bg(SURFACE))
             .border_style(fg(WARN));
         let lines = approval_lines(&p.prompt, area.width.saturating_sub(2) as usize);
         let rows = area.height.saturating_sub(4) as usize;
@@ -1732,7 +1811,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect, lines: &[String], cursor
             },
             if app.running { muted() } else { fg(USER) },
         ))
-        .style(fg(TEXT).bg(SURFACE))
+        .style(fg(USER_TEXT).bg(SURFACE))
         .border_style(border);
 
     if area.height < 3 || area.width < 5 {
@@ -1779,5 +1858,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect, lines: &[String], cursor
     f.set_cursor_position((x.min(area.x + area.width.saturating_sub(2)), y));
 }
 
+#[cfg(test)]
+mod inline_tests;
 #[cfg(test)]
 mod tests;

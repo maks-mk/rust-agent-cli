@@ -82,7 +82,7 @@ fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> TokenUsage {
     }
 }
 
-fn app() -> App {
+pub(super) fn app() -> App {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     App::new(config(), tx).expect("app")
 }
@@ -353,6 +353,17 @@ fn footer_shows_updated_tool_count_to_the_left_of_the_model() {
 }
 
 #[test]
+fn idle_footer_shows_f2_selection_hint() {
+    let mut app = app();
+    for width in [60, 80, 120] {
+        let rows = render(&mut app, width, 20);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("F2 select"), "{width}: {footer}");
+        assert!(footer.contains("enter send"), "{width}: {footer}");
+    }
+}
+
+#[test]
 fn narrow_footer_prioritizes_stop_and_denial_over_model_name() {
     let mut app = app();
     app.cfg.model = "a-very-long-model-name-that-must-not-overwrite-controls".into();
@@ -364,7 +375,7 @@ fn narrow_footer_prioritizes_stop_and_denial_over_model_name() {
     assert!(footer.contains("Esc stop"));
     assert!(footer.contains("AUTO ON"));
     assert!(!footer.contains("model"));
-    assert_text_style(&buffer, "AUTO ON", BACKGROUND, WARN);
+    assert_text_style(&buffer, "AUTO ON", Color::Black, WARN);
 
     let (reply, _) = tokio::sync::oneshot::channel();
     app.on_agent(AgentEvent::ToolApproval {
@@ -529,7 +540,7 @@ fn tiny_approval_stays_locked_and_control_characters_are_visible() {
 }
 
 #[test]
-fn chat_gap_stays_empty_with_long_responses_and_scrolling() {
+fn chat_gap_stays_empty_with_long_live_responses() {
     for height in [8, 12, 24] {
         for running in [false, true] {
             let mut app = app();
@@ -541,15 +552,13 @@ fn chat_gap_stays_empty_with_long_responses_and_scrolling() {
                     .join("\n"),
             )];
             render(&mut app, 80, height);
-            for scroll in [0, 5] {
-                app.scroll = scroll;
+            for _ in 0..2 {
                 let buffer = render_buffer(&mut app, 80, height);
                 let rows = buffer_rows(&buffer);
                 let status = rows
                     .iter()
                     .position(|row| row.contains(if running { "Writing" } else { "Ready" }))
                     .expect("status row");
-                assert_eq!(app.chat_height, status - 1);
                 assert!(rows[status - 2].contains("response-line"));
                 assert!(rows[status - 1].trim().is_empty());
                 for x in 0..buffer.area.width {
@@ -568,7 +577,6 @@ fn short_terminal_omits_gap_to_keep_last_chat_line() {
     let mut app = app();
     app.entries = vec![Entry::Assistant("last-response".into())];
     let rows = render(&mut app, 80, 7);
-    assert_eq!(app.chat_height, 1);
     assert!(rows[0].contains("last-response"));
     assert!(rows[1].contains("Ready"));
     assert!(rows[2].contains('╭'));

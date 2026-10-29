@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod background;
+mod inline;
 mod mcp;
 mod session;
 #[cfg(any(windows, test))]
@@ -8,26 +9,6 @@ mod terminal_input;
 mod ui;
 
 use anyhow::{bail, Result};
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-};
-#[cfg(not(windows))]
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use futures_util::StreamExt;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
-use std::io;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::time::Duration;
-use tokio::sync::mpsc;
-
 const HELP: &str = "\
 rust-agent: a terminal coding agent for any OpenAI-compatible API
 
@@ -146,188 +127,9 @@ fn load_config() -> Result<agent::Config> {
     })
 }
 
-fn should_capture_mouse(modern_terminal: bool) -> bool {
-    !cfg!(windows) || modern_terminal
-}
-
-fn set_mouse_capture(enabled: bool) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        // Crossterm's Windows backend uses Win32 console input records. Quick Edit
-        // (native text selection) and mouse events conflict, so toggle both modes.
-        win_console::set_mouse_capture(enabled)
-    }
-    #[cfg(not(windows))]
-    {
-        let mut stdout = io::stdout();
-        if enabled {
-            execute!(stdout, EnableMouseCapture)
-        } else {
-            execute!(stdout, DisableMouseCapture)
-        }
-    }
-}
-
-fn restore_terminal() {
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, DisableBracketedPaste);
-    // Always turn mouse capture off first. On Windows this restores native Quick Edit;
-    // disable_raw_mode then restores the console's original input mode.
-    let _ = set_mouse_capture(false);
-    let _ = disable_raw_mode();
-    let _ = execute!(stdout, LeaveAlternateScreen);
-}
-
-#[cfg(windows)]
-mod win_console {
-    use std::{ffi::c_void, io};
-
-    type Handle = *mut c_void;
-    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
-    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
-    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn GetStdHandle(kind: u32) -> Handle;
-        fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
-        fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
-    }
-
-    pub fn set_mouse_capture(enabled: bool) -> io::Result<()> {
-        // Keep all other console input flags (including the raw-mode flags) unchanged.
-        unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            if handle.is_null() || handle as isize == -1 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut mode = 0u32;
-            if GetConsoleMode(handle, &mut mode) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            mode |= ENABLE_EXTENDED_FLAGS;
-            if enabled {
-                mode |= ENABLE_MOUSE_INPUT;
-                mode &= !ENABLE_QUICK_EDIT_MODE;
-            } else {
-                mode &= !ENABLE_MOUSE_INPUT;
-                mode |= ENABLE_QUICK_EDIT_MODE;
-            }
-
-            if SetConsoleMode(handle, mode) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = load_config()?;
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = app::App::new(cfg, tx)?;
-
-    // Classic Windows Console Host is common when the EXE is launched by double-click.
-    // Start there with mouse capture off so native text selection remains available.
-    // F2 toggles between native text selection and in-app mouse scrolling.
-    let capture_mouse = Arc::new(AtomicBool::new(should_capture_mouse(
-        std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM_PROGRAM").is_some(),
-    )));
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    // Configure mouse/selection mode explicitly. On classic Windows consoles this
-    // enables Quick Edit by default; on modern terminals it enables mouse events.
-    set_mouse_capture(capture_mouse.load(Ordering::SeqCst))?;
-    // Bracketed paste is not supported by every Windows console; ignore failures.
-    let _ = execute!(stdout, EnableBracketedPaste);
-
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        prev_hook(info);
-    }));
-
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = run(&mut terminal, &mut app, &mut rx, &capture_mouse).await;
-    restore_terminal();
-    let saved = app.shutdown().await;
-    result.and(saved)
-}
-
-async fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut app::App,
-    rx: &mut mpsc::UnboundedReceiver<agent::AgentEvent>,
-    capture_mouse: &Arc<AtomicBool>,
-) -> Result<()> {
-    let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(80));
-
-    loop {
-        terminal.draw(|f| ui::draw(f, app))?;
-
-        tokio::select! {
-            ev = events.next() => match ev {
-                Some(Ok(event)) => {
-                    #[cfg(windows)]
-                    let batch = terminal_input::collect_burst(&mut events, event).await?;
-                    #[cfg(not(windows))]
-                    let batch = vec![event];
-                    for event in batch {
-                        let toggle_mouse = matches!(
-                            &event,
-                            Event::Key(key)
-                                if key.kind == KeyEventKind::Press && key.code == KeyCode::F(2)
-                        );
-                        if toggle_mouse {
-                            let enabled = !capture_mouse.load(Ordering::SeqCst);
-                            let changed = set_mouse_capture(enabled);
-                            match changed {
-                                Ok(()) => {
-                                    capture_mouse.store(enabled, Ordering::SeqCst);
-                                    let message = if enabled {
-                                        "Mouse mode ON: use the wheel to scroll. Press F2 for text selection."
-                                    } else {
-                                        "Mouse mode OFF: select/copy text with the terminal. Press F2 to enable mouse scrolling."
-                                    };
-                                    app.entries.push(app::Entry::Notice(message.into()));
-                                }
-                                Err(e) => app.entries.push(app::Entry::Error(format!(
-                                    "Could not change mouse mode: {e}"
-                                ))),
-                            }
-                        } else {
-                            app.on_event(event);
-                        }
-                    }
-                },
-                Some(Err(_)) | None => break,
-            },
-            Some(msg) = rx.recv() => {
-                app.on_agent(msg);
-                // Drain whatever else is queued so streaming bursts cost one redraw.
-                while let Ok(m) = rx.try_recv() {
-                    app.on_agent(m);
-                }
-            }
-            _ = tick.tick() => {
-                app.tick = app.tick.wrapping_add(1);
-            }
-        }
-
-        app.finish_cancel(rx).await;
-        app.poll_session_save();
-        if app.should_quit {
-            break;
-        }
-    }
-    Ok(())
+    inline::start(load_config()?).await
 }
 
 #[cfg(test)]
