@@ -231,10 +231,7 @@ async fn edit_file_truncates_diff_without_truncating_the_actual_edit() {
     let api = MockApi::start(vec![]).await;
     let (tx, _) = tokio::sync::mpsc::unbounded_channel();
     for (old, new) in [
-        (
-            "old\n".repeat(MAX_EDIT_DIFF_LINES + 20),
-            "new\n".repeat(MAX_EDIT_DIFF_LINES + 20),
-        ),
+        ("old\n".repeat(300), "new\n".repeat(300)),
         (
             format!("{}\n", "я".repeat(MAX_EDIT_DIFF_BYTES)),
             "new\n".to_string(),
@@ -251,11 +248,21 @@ async fn edit_file_truncates_diff_without_truncating_the_actual_edit() {
         .await;
         assert_eq!(status, ToolStatus::Ok);
         assert!(content.contains(EDIT_DIFF_TRUNCATION));
+        assert!(content.contains(EDIT_DIFF_PARTIAL_HUNK));
+        assert!(content.contains(&format!(
+            "(+{} −{} lines)",
+            new.lines().count(),
+            old.lines().count()
+        )));
         let start = content.find("Applied diff").unwrap();
         let end = content.find("Line endings:").unwrap();
         let diff = &content[start..end];
         assert!(diff.len() <= MAX_EDIT_DIFF_BYTES, "{} bytes", diff.len());
         assert!(diff.lines().count() <= MAX_EDIT_DIFF_LINES);
+        assert!(!diff.lines().any(|line| line.starts_with('+')), "{diff}");
+        if old.lines().count() > MAX_EDIT_DIFF_LINES {
+            assert!(diff.lines().any(|line| line.starts_with('-')), "{diff}");
+        }
         assert_eq!(
             std::fs::read_to_string(api.cfg.root.join("note.txt")).unwrap(),
             new

@@ -55,6 +55,7 @@ const MAX_DIFF_LINES: usize = 30;
 const MAX_EDIT_DIFF_LINES: usize = 200;
 const MAX_EDIT_DIFF_BYTES: usize = 16_000;
 const EDIT_DIFF_TRUNCATION: &str = "[Diff truncated; the entire edit was applied. Use read_file with offset/limit to inspect omitted changes.]\n";
+const EDIT_DIFF_PARTIAL_HUNK: &str = "[Partial last hunk: @@ ranges describe the full hunk; visible lines may omit insertions or deletions.]\n";
 /// Total budget for the command output handed to the model. Every stream keeps
 /// a head and a tail inside this budget, so the model still sees how the
 /// command ended instead of a cut-off middle.
@@ -454,9 +455,9 @@ fn system_prompt(cfg: &Config) -> String {
          * Use `rg --files` to locate files and `rg -n` with path/glob filters to search text; \
          read matched ranges. Fall back to native search only if rg is unavailable.\n\
          * Read before editing; preserve unrelated work and conventions; fix root causes \
-         minimally; prefer targeted edits and reuse existing dependencies. After each edit, rely \
-         on the applied diff in the tool result; re-read only if it was truncated or the file \
-         state is uncertain.\n\
+         minimally; prefer targeted edits and reuse existing dependencies. After a successful \
+         `edit_file`, rely on the applied diff in its result; re-read only if it was truncated \
+         or the file state is uncertain.\n\
          * `shell` is for inspection, builds, and tests, never for editing. Even with \
          auto-approve, confirm destructive or production actions explicitly.\n\
          * Verify uncertain APIs against installed versions/official docs (Context7 if \
@@ -2751,10 +2752,10 @@ fn edit_file_diff(old: &str, new: &str) -> (String, usize, usize) {
     let mut lines = 1;
     let mut append = |prefix: &str, text: &str| {
         let needs_newline = !text.ends_with('\n');
-        // Reserve room for the truncation notice without splitting a UTF-8 line.
-        if lines >= MAX_EDIT_DIFF_LINES - 1
+        // Reserve room for both notices without splitting a UTF-8 line.
+        if lines >= MAX_EDIT_DIFF_LINES - 2
             || out.len() + prefix.len() + text.len() + usize::from(needs_newline)
-                > MAX_EDIT_DIFF_BYTES - EDIT_DIFF_TRUNCATION.len()
+                > MAX_EDIT_DIFF_BYTES - EDIT_DIFF_TRUNCATION.len() - EDIT_DIFF_PARTIAL_HUNK.len()
         {
             return false;
         }
@@ -2767,6 +2768,7 @@ fn edit_file_diff(old: &str, new: &str) -> (String, usize, usize) {
         true
     };
     let mut truncated = false;
+    let mut partial_hunk = false;
     let mut unified = diff.unified_diff();
     unified.context_radius(2);
     'hunks: for hunk in unified.iter_hunks() {
@@ -2784,11 +2786,15 @@ fn edit_file_diff(old: &str, new: &str) -> (String, usize, usize) {
                 || (change.missing_newline() && !append("", "\\ No newline at end of file"))
             {
                 truncated = true;
+                partial_hunk = true;
                 break 'hunks;
             }
         }
     }
     if truncated {
+        if partial_hunk {
+            out.push_str(EDIT_DIFF_PARTIAL_HUNK);
+        }
         out.push_str(EDIT_DIFF_TRUNCATION);
     }
     (out, added, removed)

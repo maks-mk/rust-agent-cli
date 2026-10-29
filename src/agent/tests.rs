@@ -256,7 +256,7 @@ fn system_prompt_is_compact_and_covers_essential_policy() {
         "preserve unrelated work and conventions",
         "fix root causes minimally",
         "reuse existing dependencies",
-        "rely on the applied diff in the tool result",
+        "After a successful `edit_file`, rely on the applied diff in its result",
         "re-read only if it was truncated",
         "never for editing",
         "Even with auto-approve, confirm destructive or production actions explicitly",
@@ -269,6 +269,7 @@ fn system_prompt_is_compact_and_covers_essential_policy() {
     ] {
         assert!(prompt.contains(rule), "missing rule: {rule}");
     }
+    assert!(!prompt.contains("After each edit"));
     // Tool mechanics belong to the schemas, implementations, and error text.
     for redundant in [
         "PowerShell",
@@ -284,6 +285,63 @@ fn system_prompt_is_compact_and_covers_essential_policy() {
             "prompt duplicates tool mechanics: {redundant}"
         );
     }
+}
+
+#[test]
+fn edit_file_diff_line_limit_between_hunks_does_not_mark_a_complete_hunk_partial() {
+    // Title, hunk header, two context lines, and two reserved notices use six lines.
+    let replacements = (MAX_EDIT_DIFF_LINES - 6) / 2;
+    let separator = "keep 1\nkeep 2\nkeep 3\nkeep 4\nkeep 5\n";
+    let old = format!("{}{separator}old last\n", "old\n".repeat(replacements));
+    let new = format!("{}{separator}new last\n", "new\n".repeat(replacements));
+
+    let (diff, added, removed) = edit_file_diff(&old, &new);
+
+    assert_eq!((added, removed), (replacements + 1, replacements + 1));
+    assert!(diff.contains(EDIT_DIFF_TRUNCATION), "{diff}");
+    assert!(!diff.contains(EDIT_DIFF_PARTIAL_HUNK), "{diff}");
+    assert_eq!(
+        diff.lines().filter(|line| line.starts_with("@@")).count(),
+        1
+    );
+    assert_eq!(
+        diff.lines().filter(|line| line.starts_with('-')).count(),
+        replacements
+    );
+    assert_eq!(
+        diff.lines().filter(|line| line.starts_with('+')).count(),
+        replacements
+    );
+    assert!(diff.ends_with(&format!(" keep 1\n keep 2\n{EDIT_DIFF_TRUNCATION}")));
+    assert!(diff.lines().count() <= MAX_EDIT_DIFF_LINES);
+    assert!(diff.len() <= MAX_EDIT_DIFF_BYTES);
+}
+
+#[test]
+fn edit_file_diff_byte_limit_between_hunks_does_not_mark_a_complete_hunk_partial() {
+    let (first_hunk, _, _) = edit_file_diff("old first\n\nkeep 1\n", "new first\n\nkeep 1\n");
+    let preview_budget =
+        MAX_EDIT_DIFF_BYTES - EDIT_DIFF_TRUNCATION.len() - EDIT_DIFF_PARTIAL_HUNK.len();
+    let padding = "я".repeat((preview_budget - first_hunk.len()) / "я".len());
+    let separator = format!("{padding}\nkeep 1\nkeep 2\nkeep 3\nkeep 4\n");
+    let old = format!("old first\n{separator}old last\n");
+    let new = format!("new first\n{separator}new last\n");
+
+    let (diff, added, removed) = edit_file_diff(&old, &new);
+
+    assert_eq!((added, removed), (2, 2));
+    assert!(diff.contains(EDIT_DIFF_TRUNCATION), "{diff}");
+    assert!(!diff.contains(EDIT_DIFF_PARTIAL_HUNK), "{diff}");
+    assert_eq!(
+        diff.lines().filter(|line| line.starts_with("@@")).count(),
+        1
+    );
+    assert!(diff.contains("-old first\n+new first\n"));
+    assert!(diff.ends_with(&format!(" keep 1\n{EDIT_DIFF_TRUNCATION}")));
+    let visible = diff.strip_suffix(EDIT_DIFF_TRUNCATION).unwrap();
+    assert!(preview_budget - visible.len() < "я".len());
+    assert!(diff.lines().count() <= MAX_EDIT_DIFF_LINES);
+    assert!(diff.len() <= MAX_EDIT_DIFF_BYTES);
 }
 
 #[test]
