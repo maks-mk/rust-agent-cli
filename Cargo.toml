@@ -1,6 +1,6 @@
 [package]
 name = "rust-agent"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A small terminal (TUI) coding agent for any OpenAI-compatible API"
 
