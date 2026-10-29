@@ -100,10 +100,10 @@ fn banners_fit_without_wrapping() {
                 }
                 let art = has_pixel_art(width, ascii);
                 let expected_lines = match (ascii, art) {
-                    (true, true) => 12,
-                    (true, false) => 6,
-                    (false, true) => 15,
-                    (false, false) => 9,
+                    (true, true) => 10,
+                    (true, false) => 4,
+                    (false, true) => 13,
+                    (false, false) => 7,
                 };
                 assert_eq!(lines.len(), expected_lines, "width={width}, ascii={ascii}");
                 for (line, hang) in &lines {
@@ -135,13 +135,13 @@ fn banners_fit_without_wrapping() {
 fn unicode_banner_uses_pixel_wordmark_and_gray_metadata() {
     let cfg = config("demo", "rust-agent");
     let lines = banner_with_glyphs(&cfg, 100, glyphs_for(false));
-    assert_eq!(lines.len(), 15);
+    assert_eq!(lines.len(), 13);
     assert!(text(&lines[1].0).contains("██") || text(&lines[1].0).contains("▓▓"));
     assert!(text(&lines[7].0).contains("██") || text(&lines[7].0).contains("▓▓"));
     assert!(text(&lines[8].0).contains("rust-agent v"));
-    assert!(text(&lines[10].0).contains("model"));
-    assert!(text(&lines[11].0).contains("server"));
-    assert!(text(&lines[12].0).contains("folder"));
+    assert!(text(&lines[10].0).contains("folder"));
+    assert!(!text(&lines[10].0).contains("model"));
+    assert!(!text(&lines[10].0).contains("server"));
     for (line, _) in &lines[1..8] {
         assert!(text(line).starts_with("│  "));
     }
@@ -153,19 +153,17 @@ fn unicode_banner_uses_pixel_wordmark_and_gray_metadata() {
 fn ascii_banner_is_borderless_and_has_pixel_wordmark() {
     let cfg = config("demo", "rust-agent");
     let lines = banner_with_glyphs(&cfg, 80, glyphs_for(true));
-    assert_eq!(lines.len(), 12);
+    assert_eq!(lines.len(), 10);
     assert!(text(&lines[0].0).contains("##") || text(&lines[0].0).contains("::"));
     assert!(text(&lines[7].0).contains(&format!("rust-agent v{}", env!("CARGO_PKG_VERSION"))));
-    assert_eq!(text(&lines[9].0), "  model   demo");
-    assert_eq!(text(&lines[10].0), "  server  api.example.com");
-    assert_eq!(text(&lines[11].0), "  folder  rust-agent");
+    assert_eq!(text(&lines[9].0), "  folder  rust-agent");
     for (line, _) in &lines {
         let value = text(line);
         assert!(value.is_ascii());
         assert!(!value.contains('|'));
         assert!(!value.contains("+-") && !value.contains("-+"));
     }
-    for index in [7, 9, 10, 11] {
+    for index in [7, 9] {
         assert!(!text(&lines[index].0).ends_with(' '));
     }
 }
@@ -197,9 +195,7 @@ fn long_folder_keeps_its_tail() {
     for ascii in [false, true] {
         let lines = banner_with_glyphs(&cfg, 40, glyphs_for(ascii));
         let ellipsis = glyphs_for(ascii).ellipsis;
-        let model_index = if ascii { 3 } else { 4 };
-        let folder_index = if ascii { 5 } else { 6 };
-        assert!(text(&lines[model_index].0).contains(ellipsis));
+        let folder_index = if ascii { 3 } else { 4 };
         let folder_row = text(&lines[folder_index].0);
         assert!(folder_row.contains(ellipsis));
         assert!(folder_row.contains("rust-agent"));

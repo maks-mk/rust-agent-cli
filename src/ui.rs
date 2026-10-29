@@ -744,14 +744,6 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
     if width < 2 {
         return Vec::new();
     }
-    let host = cfg
-        .base_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string();
     let cwd = display_path(&cfg.root);
 
     let padding = width.saturating_sub(2).saturating_div(2).min(2);
@@ -762,11 +754,7 @@ fn banner_with_glyphs(cfg: &Config, width: usize, g: Glyphs) -> Vec<RLine> {
     };
     let label_width = 8.min(available);
     let max_val = available.saturating_sub(label_width).min(56);
-    let rows = [
-        ("model", fit(&cfg.model, max_val, g.ellipsis)),
-        ("server", fit(&host, max_val, g.ellipsis)),
-        ("folder", fit_left(&cwd, max_val, g.ellipsis)),
-    ];
+    let rows = [("folder", fit_left(&cwd, max_val, g.ellipsis))];
 
     let mut art_rows = pixel_wordmark(g.ascii, available).unwrap_or_else(|| {
         vec![vec![Span::styled(
