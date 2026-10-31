@@ -631,6 +631,107 @@ fn finished_tools_do_not_leave_a_running_tools_status() {
 }
 
 #[test]
+fn parallel_tools_keep_running_status_until_every_tool_finishes() {
+    for status in [ToolStatus::Ok, ToolStatus::Failed, ToolStatus::Denied] {
+        let mut app = app();
+        app.running = true;
+        for id in ["first", "last"] {
+            app.on_agent(AgentEvent::ToolStart {
+                id: id.into(),
+                label: "Read".into(),
+                target: String::new(),
+            });
+        }
+        app.on_agent(AgentEvent::ToolEnd {
+            id: "last".into(),
+            status,
+            summary: "Finished last-listed tool".into(),
+        });
+        let screen = render(&mut app, 90, 20).join("\n");
+        assert!(screen.contains("Running tools"), "{screen}");
+        assert!(!screen.contains("Waiting for model"), "{screen}");
+        assert!(app.rendered.has_running_tool());
+
+        app.on_agent(AgentEvent::ToolEnd {
+            id: "first".into(),
+            status: ToolStatus::Ok,
+            summary: "Finished remaining tool".into(),
+        });
+        let screen = render(&mut app, 90, 20).join("\n");
+        assert!(screen.contains("Waiting for model"), "{screen}");
+        assert!(!screen.contains("Running tools"), "{screen}");
+        assert!(!app.rendered.has_running_tool());
+    }
+}
+
+#[test]
+fn write_file_history_hides_saved_content_previews() {
+    let mut app = app();
+    app.entries = vec![Entry::Tool(ToolEntry {
+        id: "write".into(),
+        label: "Write".into(),
+        target: "note.txt".into(),
+        status: ToolStatus::Ok,
+        diff: vec![
+            DiffLine {
+                kind: DiffKind::Add,
+                text: "private new content".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Del,
+                text: "private old content".into(),
+            },
+        ],
+        result: Some("Writed 1 lines".into()),
+        output: None,
+    })];
+    let screen = render(&mut app, 90, 20).join("\n");
+    assert!(screen.contains("Writed 1 lines"), "{screen}");
+    assert!(!screen.contains("private"), "{screen}");
+}
+
+#[test]
+fn context_usage_is_right_aligned_without_overlapping_status_or_scroll_hint() {
+    let mut app = app();
+    app.context_tokens = 41071;
+    app.context_limit = 100000;
+    for running in [false, true] {
+        app.running = running;
+        for scroll in [0, 8] {
+            app.scroll = scroll;
+            for width in [80, 100, 140] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal.draw(|f| draw_status(f, &app, f.area())).unwrap();
+                let row = buffer_rows(terminal.backend().buffer()).join("");
+                assert!(
+                    row.ends_with("Context [####------] 41%  ~41071 / 100000 tokens"),
+                    "{width}: {row}"
+                );
+                assert!(
+                    row.contains(if running {
+                        "Waiting for model"
+                    } else {
+                        "Ready"
+                    }),
+                    "{width}: {row}"
+                );
+                if scroll > 0 && width >= 100 {
+                    assert!(row.contains("Ctrl+End"), "{width}: {row}");
+                }
+            }
+        }
+    }
+    for width in [1, 16, 32, 48, 60] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal.draw(|f| draw_status(f, &app, f.area())).unwrap();
+        let row = buffer_rows(terminal.backend().buffer()).join("");
+        if let Some(start) = row.find("Context") {
+            assert_eq!(&row[start..], "Context 41%", "{width}: {row}");
+        }
+    }
+}
+
+#[test]
 fn context_usage_has_warning_and_critical_thresholds() {
     let mut app = app();
     app.entries.clear();

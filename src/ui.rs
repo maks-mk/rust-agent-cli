@@ -582,7 +582,13 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
                 header.push(Span::styled(format!("  {}", t.target), muted()));
             }
             v.push((Line::from(header), 2));
-            for d in &t.diff {
+            // Older sessions may still contain write_file previews.
+            let diff = if t.label == "Write" {
+                &[][..]
+            } else {
+                t.diff.as_slice()
+            };
+            for d in diff {
                 let (text, style) = match d.kind {
                     DiffKind::Add => (format!("+ {}", d.text), fg(OK)),
                     DiffKind::Del => (format!("- {}", d.text), fg(ERR)),
@@ -1634,17 +1640,6 @@ fn context_color(app: &App) -> Color {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let hint = if app.scroll > 0 {
-        let down = if ascii_mode() { "v" } else { "↓" };
-        if area.width >= 70 {
-            format!("{down} {} lines below | Ctrl+End", app.scroll)
-        } else {
-            format!("{down}{} | ^End", app.scroll)
-        }
-    } else {
-        String::new()
-    };
-    let (left, right) = bar_areas(area, hint.chars().map(cw).sum());
     let color = if app.pending.is_some() {
         WARN
     } else if app.running {
@@ -1656,9 +1651,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         "Approval required"
     } else if app.compressing_context {
         "Compressing context"
+    } else if app.running && app.rendered.has_running_tool() {
+        "Running tools"
     } else if app.running {
         match app.entries.last() {
-            Some(Entry::Tool(t)) if matches!(t.status, ToolStatus::Running) => "Running tools",
             Some(Entry::Thinking(_)) => "Thinking",
             Some(Entry::Assistant(_)) => "Writing",
             _ => "Waiting for model",
@@ -1666,6 +1662,38 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Ready"
     };
+    let label_width = label.chars().map(cw).sum::<usize>() + if app.running { 2 } else { 0 };
+    let context = context_bar(app).and_then(|bar| {
+        let available = (area.width as usize).saturating_sub(label_width.max(16) + 1);
+        if bar.len() <= available {
+            Some(bar)
+        } else {
+            let compact = format!(
+                "Context {}%",
+                (app.context_tokens as f64 / app.context_limit as f64 * 100.0).min(100.0) as usize
+            );
+            (compact.len() <= available).then_some(compact)
+        }
+    });
+    let (status_area, context_area) = bar_areas(area, context.as_ref().map_or(0, String::len));
+    let hint = if app.scroll > 0 {
+        let down = if ascii_mode() { "v" } else { "↓" };
+        let available = (status_area.width as usize).saturating_sub(label_width.max(16) + 1);
+        let full = format!("{down} {} lines below | Ctrl+End", app.scroll);
+        if full.chars().map(cw).sum::<usize>() <= available {
+            full
+        } else {
+            let compact = format!("{down}{} | ^End", app.scroll);
+            if compact.chars().map(cw).sum::<usize>() <= available {
+                compact
+            } else {
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+    let (left, right) = bar_areas(status_area, hint.chars().map(cw).sum());
     let mut spans = Vec::new();
     if app.running {
         let spin_set: &[&str] = if ascii_mode() {
@@ -1685,27 +1713,18 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             muted(),
         ));
     }
-    if let Some(bar) = context_bar(app) {
-        let used: usize = spans.iter().map(Span::width).sum();
-        let compact = format!(
-            "Context {}%",
-            (app.context_tokens as f64 / app.context_limit as f64 * 100.0) as usize
-        );
-        let context = if used + bar.len() + 3 <= left.width as usize {
-            bar
-        } else {
-            compact
-        };
-        if used + context.len() + 3 <= left.width as usize {
-            spans.push(Span::styled(" | ", muted()));
-            spans.push(Span::styled(context, fg(context_color(app))));
-        }
-    }
     f.render_widget(Paragraph::new(Line::from(spans)), left);
     f.render_widget(
         Paragraph::new(Span::styled(hint, fg(WARN))).alignment(Alignment::Right),
         right,
     );
+    if let Some(context) = context {
+        f.render_widget(
+            Paragraph::new(Span::styled(context, fg(context_color(app))))
+                .alignment(Alignment::Right),
+            context_area,
+        );
+    }
 }
 
 fn token_usage_lines(usage: &ChatUsage, width: usize, ascii: bool) -> Vec<Line<'static>> {

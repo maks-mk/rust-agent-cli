@@ -251,6 +251,39 @@ fn retry_policy_respects_backoff_and_retry_after() {
     }
 }
 
+#[test]
+fn provider_retry_policy_distinguishes_transient_and_permanent_errors() {
+    for event in [
+        json!({"error": {"code": "InternalError.Algo", "message": "serving failed"}}),
+        json!({"error": {"code": 500, "message": "temporary"}}),
+        json!({"error": {"code": "503", "message": "temporary"}}),
+        json!({"type": "error", "code": "server_error", "message": "temporary"}),
+        json!({"type": "response.failed", "response": {"error": {"code": "internal_error", "message": "temporary"}}}),
+        json!({"error": {"code": "rate_limit_exceeded", "message": "slow down"}}),
+        json!({"error": {"message": "<500> temporary"}}),
+        json!({"error": "Inference engine abort. Finish reason: [UNKNOWN]."}),
+    ] {
+        let error = provider_completion_error(&event, "unknown");
+        assert_eq!(
+            retry_delay(&error, 0),
+            Some(Duration::from_secs(2)),
+            "{event}"
+        );
+        assert_eq!(retry_delay(&error, 3), None);
+    }
+    for event in [
+        json!({"error": {"code": "invalid_api_key", "message": "unauthorized"}}),
+        json!({"error": {"code": "invalid_request_error", "message": "bad request"}}),
+        json!({"error": {"code": "insufficient_quota", "message": "quota exhausted"}}),
+        json!({"error": {"code": 401, "message": "Inference engine abort"}}),
+        json!({"error": {"message": "<400> invalid request"}}),
+        json!({"type": "response.failed", "response": {"error": {"message": "unknown failure"}}}),
+    ] {
+        let error = provider_completion_error(&event, "unknown");
+        assert_eq!(retry_delay(&error, 0), None, "{event}");
+    }
+}
+
 #[tokio::test]
 async fn retries_transient_http_and_disconnected_requests() {
     for status in [0, 408, 429, 500, 502, 503, 504] {
@@ -299,6 +332,133 @@ async fn retries_transient_http_and_disconnected_requests() {
 }
 
 #[tokio::test]
+async fn recover_chunked_stream_eof_without_reusing_partial_output() {
+    let partial = format!(
+        "data: {}\n\n",
+        json!({
+            "choices": [{"delta": {
+                "content": "discard me",
+                "reasoning_content": "discard reasoning",
+                "tool_calls": [{"index": 0, "id": "partial", "function": {
+                    "name": "shell", "arguments": "{"
+                }}]
+            }}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        })
+    );
+    // A complete data chunk followed by EOF while the next chunk-size line is missing.
+    let broken_body = format!("{:x}\r\n{partial}\r\n", partial.len());
+    let success = sse(vec![
+        delta(json!({"content": "success"})),
+        json!({"choices": [], "usage": {
+            "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13
+        }}),
+    ]);
+    let mut api = MockApi::start_scripted(
+        vec![
+            (200, broken_body, "Transfer-Encoding: chunked\r\n".into()),
+            (200, success, String::new()),
+        ],
+        1024,
+        false,
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = timeout(
+        Duration::from_secs(10),
+        completion_with_retries(
+            &reqwest::Client::new(),
+            &api.cfg,
+            &[],
+            Some(&json!([])),
+            &tx,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.text, "success");
+    assert!(result.calls.is_empty());
+    let requests = api.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    let mut discards = 0;
+    let mut reports = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::CompletionDiscard => discards += 1,
+            AgentEvent::Usage { usage, complete } => reports.push((usage.total_tokens, complete)),
+            _ => {}
+        }
+    }
+    assert_eq!(discards, 1);
+    assert_eq!(reports, vec![(12, false), (13, true)]);
+}
+
+#[tokio::test]
+async fn recover_inference_engine_abort_from_http_and_sse() {
+    let message = "<500> InternalError.Algo: An error occurred in model serving, error message is: [Inference engine abort. Finish reason: [UNKNOWN].]";
+    for (mode, status, failure, success) in [
+        (
+            ApiMode::Chat,
+            500,
+            json!({"error": {"code": "InternalError.Algo", "message": message}}).to_string(),
+            sse(vec![delta(json!({"content": "success"}))]),
+        ),
+        (
+            ApiMode::Chat,
+            200,
+            format!(
+                "data: {}\n\n",
+                json!({"error": {"code": "InternalError.Algo", "message": message}})
+            ),
+            sse(vec![delta(json!({"content": "success"}))]),
+        ),
+        (
+            ApiMode::Responses,
+            200,
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.failed", "response": {"error": {"code": "server_error", "message": message}}})
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.completed", "response": {"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "success"}]}]}})
+            ),
+        ),
+    ] {
+        let mut api = MockApi::start_scripted(
+            vec![
+                (status, failure, String::new()),
+                (200, success, String::new()),
+            ],
+            1024,
+            true,
+        )
+        .await;
+        api.cfg.api_mode = mode;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = timeout(
+            Duration::from_secs(10),
+            completion_with_retries(
+                &reqwest::Client::new(),
+                &api.cfg,
+                &[],
+                Some(&json!([])),
+                &tx,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.text, "success");
+        let requests = api.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+    }
+}
+
+#[tokio::test]
 async fn permanent_http_errors_and_limits_are_not_retried() {
     let oversized = format!("data: {}\n\n", "x".repeat(MAX_SSE_LINE_BYTES));
     for (status, body, headers) in [
@@ -306,6 +466,22 @@ async fn permanent_http_errors_and_limits_are_not_retried() {
         (400, "invalid request".into(), String::new()),
         (503, "busy".into(), "Retry-After: 61\r\n".into()),
         (200, oversized, String::new()),
+        (
+            200,
+            format!(
+                "data: {}\n\n",
+                json!({"error": {"code": "invalid_api_key", "message": "unauthorized"}})
+            ),
+            String::new(),
+        ),
+        (
+            200,
+            format!(
+                "data: {}\n\n",
+                json!({"type": "error", "code": "invalid_request_error", "message": "bad request"})
+            ),
+            String::new(),
+        ),
     ] {
         let mut api = MockApi::start_scripted(vec![(status, body, headers)], 16 * 1024, true).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

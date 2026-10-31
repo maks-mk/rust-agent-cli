@@ -1889,13 +1889,8 @@ async fn write_file(
     }
 
     let old = existed.then_some(old_text.as_str());
-    let (diff, added, removed) = full_diff(old, content);
+    let (diff, _, _) = full_diff(old, content);
     let review = file_review(&diff, old, content);
-    let diff = make_diff(diff);
-    let _ = tx.send(AgentEvent::ToolDiff {
-        id: id.to_string(),
-        diff,
-    });
 
     let rel = full
         .strip_prefix(&cfg.root)
@@ -1932,14 +1927,9 @@ async fn write_file(
         return fail(format!("cannot write {path}: {e:#}"));
     }
 
-    let summary = if existed {
-        format!("Updated · +{added} −{removed}")
-    } else {
-        format!("Created · {n_lines} lines")
-    };
     (
         ToolStatus::Ok,
-        summary,
+        format!("Writed {n_lines} lines"),
         format!("Wrote {n_lines} lines to {rel}."),
     )
 }

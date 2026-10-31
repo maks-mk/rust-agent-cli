@@ -1,6 +1,48 @@
 use super::*;
 
 #[tokio::test]
+async fn write_file_reports_line_count_without_emitting_content_to_history() {
+    let api = MockApi::start(vec![]).await;
+    let cfg = &api.cfg;
+    let path = cfg.root.join("write-summary.txt");
+    for (content, n_lines) in [
+        ("", 0),
+        ("private body", 1),
+        ("private body\n", 1),
+        ("first\nsecond", 2),
+        ("first\r\nsecond\r\n", 2),
+        ("строка\n\n", 2),
+    ] {
+        for overwrite in [false, true] {
+            if overwrite {
+                std::fs::write(&path, "old private body").unwrap();
+            } else if path.exists() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (status, summary, result) = write_file(
+                "write",
+                &json!({"path":"write-summary.txt", "content":content}),
+                cfg,
+                &tx,
+                &Arc::new(AtomicBool::new(true)),
+            )
+            .await;
+            assert_eq!(status, ToolStatus::Ok);
+            assert_eq!(summary, format!("Writed {n_lines} lines"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            assert!(result.starts_with(&format!("Wrote {n_lines} lines to ")));
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(
+                    event,
+                    AgentEvent::ToolDiff { .. } | AgentEvent::ToolOutput { .. }
+                ));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn file_approval_contains_full_diff_not_just_preview() {
     for tool in ["create", "write_file", "edit_file"] {
         let api = MockApi::start(vec![]).await;
