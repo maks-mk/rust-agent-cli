@@ -55,11 +55,12 @@ struct StderrTail {
 
 impl StderrTail {
     fn push(&self, line: &[u8]) {
-        let text: String = String::from_utf8_lossy(line)
-            .trim()
-            .chars()
-            .take(STDERR_LINE_CHARS)
-            .collect();
+        let text: String =
+            crate::process_output::terminal_safe_text(&String::from_utf8_lossy(line))
+                .trim()
+                .chars()
+                .take(STDERR_LINE_CHARS)
+                .collect();
         if text.is_empty() {
             return;
         }
@@ -195,6 +196,9 @@ impl StdioServer {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        crate::process_output::apply_output_env(&mut cmd);
+        #[cfg(windows)]
+        crate::process_output::apply_windows_flags(&mut cmd, 0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("could not start MCP server '{key}' ({command})"))?;
@@ -778,7 +782,7 @@ fn mcp_result_text(result: &Value) -> String {
     if chunks.is_empty() {
         chunks.push(result.to_string());
     }
-    let text = chunks.join("\n");
+    let text = crate::process_output::terminal_safe_text(&chunks.join("\n"));
     if text.chars().count() > MAX_TOOL_RESULT_CHARS {
         format!(
             "{}\n[output truncated]",

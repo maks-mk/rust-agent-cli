@@ -3,3 +3,4 @@
 pub mod agent;
 pub mod background;
 pub mod mcp;
+mod process_output;

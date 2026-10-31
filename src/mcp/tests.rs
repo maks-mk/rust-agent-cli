@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn mcp_text_and_stderr_are_terminal_safe() {
+    let result = json!({"content": [{"type": "text", "text": "\u{001b}[2Jold\r\u{001b}[31mГотово\u{001b}[0m\t\u{001b}]0;title\u{0007}\nnext\u{0000}"}]});
+    assert_eq!(mcp_result_text(&result), "Готово\t\nnext");
+    let tail = StderrTail::default();
+    tail.push(b"\x1b[31mold\rerror\x1b[0m\x07\n");
+    assert_eq!(tail.summary().as_deref(), Some("error"));
+}
+
+#[test]
 fn model_tool_schema_includes_loaded_mcp_tools() {
     let mut mcp = McpManager::default();
     let builtin_count = crate::agent::tools_schema(&mcp).as_array().unwrap().len();

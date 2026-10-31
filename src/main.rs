@@ -3,6 +3,7 @@ mod app;
 mod background;
 mod inline;
 mod mcp;
+mod process_output;
 mod session;
 #[cfg(any(windows, test))]
 mod terminal_input;

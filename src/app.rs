@@ -292,7 +292,8 @@ pub struct SessionMenu {
 
 // Measured usage for this conversation. Missing/unfinished requests keep known
 // sums as lower bounds; cache coverage is independent of token coverage.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ChatUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -467,6 +468,12 @@ impl App {
         cfg.reasoning_effort = effort_levels.get(effort_index).cloned().flatten();
         session.reasoning_effort = cfg.reasoning_effort.clone();
         session.workspace = cfg.root.to_string_lossy().into_owned();
+        session.token_usage.finish_turn();
+        let token_usage = session.token_usage.clone();
+        let context_tokens = session
+            .context_tokens
+            .unwrap_or_else(|| agent::estimate_history(&session.history));
+        session.context_tokens = Some(context_tokens);
         session_store.save(&mut session)?;
         session_store.activate(&session.id)?;
         let history = session.history.clone();
@@ -500,8 +507,8 @@ impl App {
             running: false,
             run_started: Instant::now(),
             streamed_chars: 0,
-            token_usage: ChatUsage::default(),
-            context_tokens: 0,
+            token_usage,
+            context_tokens,
             context_limit,
             tool_count: agent::tools_schema(&McpManager::default())
                 .as_array()
@@ -544,6 +551,7 @@ impl App {
                 _ => {}
             },
             Event::Resize(_, _) => {
+                self.clear_terminal = true;
                 if let Some(p) = &mut self.pending {
                     p.can_approve = false;
                 }
@@ -556,6 +564,12 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+
+        // Repaint without changing the draft or approval, even while a tool runs.
+        if ctrl && !alt && k.code == KeyCode::Char('l') {
+            self.clear_terminal = true;
+            return;
+        }
 
         // Tab switches the reasoning level. Ctrl+Tab is avoided on purpose:
         // Windows Terminal uses it to switch tabs, so the key never reaches
@@ -895,6 +909,11 @@ impl App {
             .collect();
         self.session.reasoning_effort = self.cfg.reasoning_effort.clone();
         self.session.workspace = self.cfg.root.to_string_lossy().into_owned();
+        self.session.token_usage = self.token_usage.clone();
+        // A restored snapshot cannot resume an in-flight request. Keep known sums,
+        // but mark missing usage as incomplete without changing the live counters.
+        self.session.token_usage.finish_turn();
+        self.session.context_tokens = Some(self.context_tokens);
     }
 
     fn save_current_session(&mut self) -> Result<()> {
@@ -1026,8 +1045,12 @@ impl App {
             "Switched to session: {}",
             self.session.title
         )));
-        self.token_usage = ChatUsage::default();
-        self.context_tokens = 0;
+        self.token_usage = self.session.token_usage.clone();
+        self.token_usage.finish_turn();
+        self.context_tokens = self
+            .session
+            .context_tokens
+            .unwrap_or_else(|| agent::estimate_history(&self.history));
         self.autosave();
         Ok(true)
     }
@@ -1359,6 +1382,7 @@ impl App {
             let _ = task.await;
         }
         self.mcp.lock().await.shutdown().await;
+        self.token_usage.finish_turn();
         self.autosave();
         self.session_store.flush().await
     }
@@ -1533,17 +1557,29 @@ impl App {
                 summary,
             } => {
                 if let Some(t) = self.tool_mut(&id) {
+                    let repaint = t.status == ToolStatus::Running
+                        && (t.label == "Shell" || t.label.starts_with("MCP "));
                     t.status = status;
                     t.result = Some(summary);
+                    if repaint {
+                        self.clear_terminal = true;
+                    }
                 }
             }
             AgentEvent::ContextUsage { tokens, limit } => {
                 self.context_tokens = tokens;
                 self.context_limit = limit;
+                self.autosave();
             }
             AgentEvent::ContextCompression { active } => self.compressing_context = active,
-            AgentEvent::UsageStart => self.token_usage.start_request(),
-            AgentEvent::Usage { usage, complete } => self.token_usage.record(usage, complete),
+            AgentEvent::UsageStart => {
+                self.token_usage.start_request();
+                self.autosave();
+            }
+            AgentEvent::Usage { usage, complete } => {
+                self.token_usage.record(usage, complete);
+                self.autosave();
+            }
             AgentEvent::HistoryPatch {
                 start,
                 end,
@@ -1569,8 +1605,8 @@ impl App {
             AgentEvent::Done(h) => {
                 self.compressing_context = false;
                 self.history = h;
-                self.autosave();
                 self.token_usage.finish_turn();
+                self.autosave();
                 if !self.cancelling {
                     self.running = false;
                     self.task = None;

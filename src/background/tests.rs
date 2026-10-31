@@ -171,6 +171,16 @@ async fn locked_job_does_not_block_another_jobs_status() {
 }
 
 #[tokio::test]
+async fn log_tail_is_terminal_safe_but_keeps_raw_log() {
+    let dir = workspace();
+    let path = dir.path().join("output.log");
+    let raw = "\x1b[2Jold\r\x1b[31mГотово\x1b[0m\t\x1b]0;title\x07\n";
+    tokio::fs::write(&path, raw).await.unwrap();
+    assert_eq!(log_tail(&path, 4096).await.as_deref(), Some("Готово\t\n"));
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), raw);
+}
+
+#[tokio::test]
 async fn log_tail_returns_the_end_of_the_log() {
     let dir = workspace();
     let job = start("echo tail-marker", dir.path()).await.unwrap();

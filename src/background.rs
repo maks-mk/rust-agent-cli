@@ -225,7 +225,9 @@ pub async fn log_tail(path: &Path, max_bytes: usize) -> Option<String> {
     file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
     let mut buf = vec![0u8; (len - start) as usize];
     file.read_exact(&mut buf).await.ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some(crate::process_output::terminal_safe_text(
+        &String::from_utf8_lossy(&buf),
+    ))
 }
 
 /// Update the state of a job from its process handle.
@@ -328,15 +330,12 @@ fn spawn_with(
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    crate::process_output::apply_output_env(&mut command);
     #[cfg(windows)]
     {
-        // The job gets no console of its own, so it neither flashes a window
-        // nor receives the interrupts of the terminal the agent runs in.
-        // `DETACHED_PROCESS` is not used: PowerShell refuses to run a script
-        // with it, while `CREATE_NO_WINDOW` starts it just fine.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // The job does not share our console or receive terminal interrupts.
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        crate::process_output::apply_windows_flags(&mut command, CREATE_NEW_PROCESS_GROUP);
     }
     #[cfg(unix)]
     {
@@ -375,6 +374,9 @@ async fn run_stop_command(command: &mut Command) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    crate::process_output::apply_output_env(command);
+    #[cfg(windows)]
+    crate::process_output::apply_windows_flags(command, 0);
     let status = tokio::time::timeout(STOP_WAIT, command.status())
         .await
         .context("background tree termination command timed out")?

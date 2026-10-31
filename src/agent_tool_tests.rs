@@ -694,6 +694,22 @@ async fn shell_capture_truncates_at_utf8_boundaries_and_marks_all_omissions() {
 }
 
 #[tokio::test]
+async fn shell_capture_sanitizes_truncated_windows_without_losing_gap_marker() {
+    let head = "head\x1b]unfinished";
+    let middle = "dropped middle";
+    let tail = "\x1b[31mold\rnew\x1b[0m";
+    let input = format!("{head}{middle}{tail}");
+    let captured = drain_output(input.as_bytes(), head.len(), tail.len())
+        .await
+        .unwrap();
+    assert_eq!(captured.total, input.len());
+    assert_eq!(
+        captured.text(),
+        format!("head\n[... {} bytes omitted ...]\nnew", middle.len())
+    );
+}
+
+#[tokio::test]
 async fn shell_capture_preserves_utf8_for_all_truncation_windows() {
     let input = "a€🦀Жz";
     for head_limit in 0..=input.len() {
@@ -858,11 +874,8 @@ async fn shell_tool_formats_empty_and_ansi_output_with_exit_code() {
             }
         }
         assert_eq!(outputs, [format!("exit code: {code}\n{expected}")]);
-        if ansi {
-            assert!(content.contains(&format!("\x1b[32;1m{label}\x1b[0m")));
-        } else {
-            assert!(content.ends_with(&format!("exit code: {code}\n(no output)")));
-        }
+        assert!(content.ends_with(&format!("exit code: {code}\n{expected}")));
+        assert!(!content.contains('\x1b'));
     }
 }
 
@@ -1074,6 +1087,53 @@ async fn background_start_needs_approval() {
     assert_eq!(approvals, 1, "the background start asked for approval");
     let (status, _, _) = task.await.unwrap();
     assert_eq!(status, ToolStatus::Denied);
+}
+
+#[tokio::test]
+async fn shell_sanitizes_captured_output_for_model_and_ui() {
+    let api = MockApi::start(vec![]).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let command = if cfg!(windows) {
+        "[Console]::Write(([char]27) + '[2J' + ([char]27) + '[1;1HANSI-SPAM' + ([char]13) + ([char]27) + '[31mred' + ([char]27) + '[0m' + ([char]10)); [Console]::Error.Write(([char]27) + ']0;title' + ([char]7) + 'stderr-ok' + ([char]10))"
+    } else {
+        "printf '\\033[2J\\033[1;1HANSI-SPAM\\r\\033[31mred\\033[0m\\n'; printf '\\033]0;title\\007stderr-ok\\n' >&2"
+    };
+    let auto = Arc::new(AtomicBool::new(true));
+    let (status, _, content) = shell(
+        "safe-output",
+        &json!({"command": command}),
+        &api.cfg,
+        &tx,
+        &auto,
+    )
+    .await;
+    assert_eq!(status, ToolStatus::Ok);
+    assert!(content.ends_with("\nred\nstderr-ok\n"), "{content:?}");
+    assert!(!content.contains('\x1b'), "{content:?}");
+    let ui = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AgentEvent::ToolOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(ui, "exit code: 0\nred\nstderr-ok");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn shell_children_cannot_write_directly_to_console() {
+    let api = MockApi::start(vec![]).await;
+    // CREATE_NO_WINDOW may still permit CONOUT$ in the child's own hidden
+    // console. The important guarantee is that it cannot write to our console.
+    let command = format!(
+        r#"$ErrorActionPreference = 'Stop'; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ConsoleProbe {{ [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList([Out] uint[] p, uint n); }}'; $pids = [uint32[]]::new(256); $count = [ConsoleProbe]::GetConsoleProcessList($pids, 256); if ($count -gt 256 -or $pids -contains {parent}) {{ [Console]::WriteLine('console-shared'); exit 1 }}; try {{ $f = [IO.File]::Open('\\.\CONOUT$', 'Open', 'Write', 'ReadWrite'); $bytes = [Text.Encoding]::UTF8.GetBytes('DIRECT-WRITE'); $f.Write($bytes, 0, $bytes.Length); $f.Dispose() }} catch {{ }}; [Console]::WriteLine('console-isolated')"#,
+        parent = std::process::id()
+    );
+    let run = shell_output(&command, &api.cfg.root, Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(run.code, 0, "{}", run.stderr.text());
+    assert_eq!(run.stdout.text().trim(), "console-isolated");
 }
 
 #[tokio::test]

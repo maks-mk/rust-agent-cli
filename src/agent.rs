@@ -753,7 +753,7 @@ pub(crate) fn is_user_request(message: &Value) -> bool {
     message["role"] == "user" && !is_image_message(message) && !is_context_summary(message)
 }
 
-fn estimate_history(history: &[Value]) -> usize {
+pub(crate) fn estimate_history(history: &[Value]) -> usize {
     history
         .iter()
         .map(estimate_tokens)
@@ -869,6 +869,47 @@ fn transient_completion_error(message: &str) -> anyhow::Error {
     .into()
 }
 
+fn retryable_completion_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn provider_completion_error(event: &Value, fallback: &str) -> anyhow::Error {
+    let error = event
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| event.pointer("/response/error"))
+        .unwrap_or(event);
+    let message = error
+        .get("message")
+        .or_else(|| event.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or(fallback);
+    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+    let status = error
+        .get("code")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .or_else(|| code.parse::<u16>().ok())
+        .or_else(|| message.strip_prefix('<')?.split_once('>')?.0.parse().ok());
+    let code = code.to_ascii_lowercase();
+    let lower_message = message.to_ascii_lowercase();
+    // Compatible providers may report a serving failure inside an HTTP 200 SSE stream.
+    let retryable = status.map(retryable_completion_status).unwrap_or_else(|| {
+        matches!(
+            code.as_str(),
+            "server_error" | "internal_error" | "rate_limit_exceeded"
+        ) || code.starts_with("internalerror.")
+            || lower_message.contains("internalerror.algo")
+            || lower_message.contains("inference engine abort")
+    });
+    if retryable {
+        transient_completion_error(message)
+    } else {
+        anyhow!("{message}")
+    }
+}
+
 fn retry_delay(error: &anyhow::Error, retry: usize) -> Option<Duration> {
     if retry >= MAX_COMPLETION_RETRIES {
         return None;
@@ -880,9 +921,15 @@ fn retry_delay(error: &anyhow::Error, retry: usize) -> Option<Duration> {
         let delay = error.retry_after.unwrap_or(backoff).max(backoff);
         return (delay <= MAX_RETRY_DELAY).then_some(delay);
     }
+    // reqwest's streaming decoder reports truncated HTTP bodies as Decode,
+    // even though SSE JSON parsing is handled separately below.
     error.downcast_ref::<reqwest::Error>().and_then(|error| {
-        (error.is_timeout() || error.is_connect() || error.is_request() || error.is_body())
-            .then_some(backoff)
+        (error.is_timeout()
+            || error.is_connect()
+            || error.is_request()
+            || error.is_body()
+            || error.is_decode())
+        .then_some(backoff)
     })
 }
 
@@ -919,7 +966,7 @@ async fn completion_with_retries(
                     let _ = tx.send(AgentEvent::CompletionDiscard);
                 }
                 let _ = tx.send(AgentEvent::Notice(format!(
-                    "Model request failed: {error}. Retry {}/{} in {}s.",
+                    "Model request failed: {error:#}. Retry {}/{} in {}s.",
                     attempt + 1,
                     MAX_COMPLETION_RETRIES,
                     delay.as_secs()
@@ -1146,7 +1193,7 @@ async fn stream_completion(
         let message = tokio::time::timeout(MODEL_IDLE_TIMEOUT, describe_http_response_error(resp))
             .await
             .unwrap_or_else(|_| describe_http_error(status.as_u16(), "error body timed out"));
-        if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+        if retryable_completion_status(status.as_u16()) {
             return Err(RetryableCompletionError {
                 message,
                 retry_after,
@@ -1216,13 +1263,7 @@ async fn stream_completion(
             }
 
             if v["type"] == "error" || v.get("error").is_some_and(|error| !error.is_null()) {
-                let msg = v
-                    .pointer("/error/message")
-                    .or_else(|| v.pointer("/response/error/message"))
-                    .or_else(|| v.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown provider error");
-                bail!("{msg}");
+                return Err(provider_completion_error(&v, "unknown provider error"));
             }
 
             if cfg.api_mode == ApiMode::Responses {
@@ -1258,11 +1299,10 @@ async fn stream_completion(
                         finished = true;
                     }
                     "response.failed" => {
-                        let message = v
-                            .pointer("/response/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Responses API request failed");
-                        bail!("{message}");
+                        return Err(provider_completion_error(
+                            &v,
+                            "Responses API request failed",
+                        ));
                     }
                     "response.incomplete" => {
                         let reason = v
@@ -2414,58 +2454,9 @@ fn shell_ui_summary(stdout: &str, stderr: &str) -> String {
     }
 }
 
-/// Strip ANSI CSI/OSC sequences, normalize lines and escape remaining controls for the TUI.
+/// Terminal-safe text with expanded tabs for compact TUI previews.
 fn shell_output_for_ui(output: &str) -> String {
-    let normalized = output.replace("\r\n", "\n").replace('\r', "\n");
-    let mut safe = String::with_capacity(normalized.len());
-    let mut chars = normalized.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let sequence = match ch {
-            '\x1b' if matches!(chars.peek(), Some('[' | ']')) => chars.next(),
-            '\u{009b}' => Some('['),
-            '\u{009d}' => Some(']'),
-            _ => None,
-        };
-        match sequence {
-            Some('[') => {
-                // Consume parameters/intermediates and one final byte. Leave ordinary
-                // text and newlines intact if the sequence is incomplete or malformed.
-                while chars
-                    .next_if(|c| ('\u{0020}'..='\u{003f}').contains(c))
-                    .is_some()
-                {}
-                chars.next_if(|c| ('\u{0040}'..='\u{007e}').contains(c));
-                continue;
-            }
-            Some(']') => {
-                // OSC ends with BEL or ST (ESC backslash / C1 ST).
-                while let Some(&c) = chars.peek() {
-                    if c == '\n' {
-                        break;
-                    }
-                    chars.next();
-                    if c == '\x07' || c == '\u{009c}' {
-                        break;
-                    }
-                    if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
-                        break;
-                    }
-                }
-                continue;
-            }
-            _ => {}
-        }
-        match ch {
-            '\n' => safe.push('\n'),
-            '\t' => safe.push_str("    "),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(safe, "\\x{:02x}", c as u32);
-            }
-            c => safe.push(c),
-        }
-    }
-    safe
+    crate::process_output::terminal_safe_text(output).replace('\t', "    ")
 }
 
 // Group ownership must outlive the pipes and every cancellable wait. On Unix
@@ -2506,9 +2497,7 @@ impl CapturedStream {
             let mut bytes = Vec::with_capacity(self.total);
             bytes.extend_from_slice(&self.head);
             bytes.extend_from_slice(&self.tail);
-            return String::from_utf8(bytes)
-                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
-                .replace("\r\n", "\n");
+            return crate::process_output::terminal_safe_text(&String::from_utf8_lossy(&bytes));
         }
 
         // Drop only incomplete code points at the gap, not malformed bytes
@@ -2528,10 +2517,12 @@ impl CapturedStream {
             .unwrap_or(self.tail.len());
         let tail = &self.tail[tail_start..];
         let omitted = self.total - head.len() - tail.len();
-        let mut out = String::from_utf8_lossy(head).into_owned();
+        let mut out = crate::process_output::terminal_safe_text(&String::from_utf8_lossy(head));
         out.push_str(&format!("\n[... {omitted} bytes omitted ...]\n"));
-        out.push_str(&String::from_utf8_lossy(tail));
-        out.replace("\r\n", "\n")
+        out.push_str(&crate::process_output::terminal_safe_text(
+            &String::from_utf8_lossy(tail),
+        ));
+        out
     }
 }
 
@@ -2599,7 +2590,13 @@ async fn shell_output(command: &str, root: &Path, deadline: Duration) -> Result<
         if let Some(path) = &path {
             command.env("PATH", path);
         }
-        command.group().kill_on_drop(true).spawn()
+        crate::process_output::apply_output_env(&mut command);
+        let mut group = command.group();
+        // command-group 5 replaces Command's flags with the builder's flags
+        // plus CREATE_SUSPENDED, so CREATE_NO_WINDOW must be set here.
+        #[cfg(windows)]
+        group.creation_flags(crate::process_output::CREATE_NO_WINDOW);
+        group.kill_on_drop(true).spawn()
     };
     let child = if cfg!(windows) {
         let (program, args) = powershell_command(command);

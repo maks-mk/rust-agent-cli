@@ -27,6 +27,10 @@ pub struct Session {
     pub history: Vec<Value>,
     #[serde(default)]
     pub tool_entries: Vec<crate::app::ToolEntry>,
+    #[serde(default)]
+    pub token_usage: crate::app::ChatUsage,
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +215,8 @@ impl SessionStore {
             updated_at: now,
             history: Vec::new(),
             tool_entries: Vec::new(),
+            token_usage: crate::app::ChatUsage::default(),
+            context_tokens: Some(0),
         })
     }
 

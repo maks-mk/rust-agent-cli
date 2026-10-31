@@ -417,10 +417,10 @@ fn base64_matches_known_vectors() {
 }
 
 #[test]
-fn shell_output_for_ui_normalizes_lines_and_escapes_control_chars() {
+fn shell_output_for_ui_normalizes_lines_and_drops_control_chars() {
     assert_eq!(
         shell_output_for_ui("one\r\ntwo\t\x1b[31mred\x1b[0m\rthree\x00\x07"),
-        "one\ntwo    red\nthree\\x00\\x07"
+        "one\nthree"
     );
 }
 
@@ -440,7 +440,7 @@ fn shell_output_for_ui_strips_ansi_without_losing_visible_text() {
         ("\x1b[31\nnext", "\nnext"),
         ("\x1b]unfinished\nnext", "\nnext"),
         ("plain [32;1m text", "plain [32;1m text"),
-        ("text\x1b", "text\\x1b"),
+        ("text\x1b", "text"),
     ] {
         assert_eq!(shell_output_for_ui(input), expected, "{input:?}");
     }
@@ -457,7 +457,7 @@ fn shell_ui_summary_normalizes_before_selecting_lines() {
     }
     assert_eq!(
         shell_ui_summary("\x1b[32mPath\x1b[0m\rnext", "\x1b[31merror\x1b[0m"),
-        "Path\nnext\nerror"
+        "next\nerror"
     );
     let stdout = format!("\x1b[31merror:\x1b[0m hidden\n{}", "ok\n".repeat(6));
     let summary = shell_ui_summary(&stdout, "");

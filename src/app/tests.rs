@@ -88,6 +88,67 @@ fn app() -> (App, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
     (App::new(config(), tx).expect("app"), rx)
 }
 
+#[test]
+fn resize_and_ctrl_l_request_repaint_without_changing_input() {
+    let (mut app, _rx) = app();
+    app.input.set("draft");
+    app.on_event(Event::Resize(100, 30));
+    assert!(app.clear_terminal);
+    app.clear_terminal = false;
+    app.on_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('l'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(app.clear_terminal);
+    assert_eq!(app.input.text(), "draft");
+    app.clear_terminal = false;
+    app.on_event(Event::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('l'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Release,
+    )));
+    assert!(!app.clear_terminal);
+    app.on_event(Event::Paste("\u{000c}paste".into()));
+    assert!(
+        !app.clear_terminal,
+        "paste must not be interpreted as a shortcut"
+    );
+}
+
+#[test]
+fn external_tool_completion_requests_one_repaint() {
+    for label in ["Shell", "MCP mcp_test_browser", "Read", "Edit"] {
+        for status in [ToolStatus::Ok, ToolStatus::Failed] {
+            let (mut app, _rx) = app();
+            app.on_agent(AgentEvent::ToolStart {
+                id: "tool".into(),
+                label: label.into(),
+                target: "test".into(),
+            });
+            assert!(!app.clear_terminal);
+            app.on_agent(AgentEvent::ToolEnd {
+                id: "tool".into(),
+                status,
+                summary: "done".into(),
+            });
+            assert_eq!(
+                app.clear_terminal,
+                label == "Shell" || label.starts_with("MCP ")
+            );
+            app.clear_terminal = false;
+            app.on_agent(AgentEvent::ToolEnd {
+                id: "tool".into(),
+                status,
+                summary: "done again".into(),
+            });
+            assert!(
+                !app.clear_terminal,
+                "duplicate completion must not clear again"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn windows_multiline_paste_stays_in_the_editor_until_explicit_enter() {
     use futures_util::stream;
@@ -339,6 +400,117 @@ fn tool_output_event_is_attached_to_matching_entry() {
         app.entries.last(),
         Some(Entry::Tool(t)) if t.output.as_deref() == Some("exit code: 0\nhi")
     ));
+}
+
+#[test]
+fn token_usage_survives_restart_and_session_switch() {
+    for state in 0..5 {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let mut cfg = config();
+        cfg.config_dir = dir.path().to_path_buf();
+        cfg.root = std::env::current_dir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(cfg.clone(), tx).unwrap();
+        let id = app.session.id.clone();
+        app.on_agent(AgentEvent::UsageStart);
+        app.on_agent(AgentEvent::Usage {
+            usage: usage(10, 4, if state == 1 { None } else { Some(0) }),
+            complete: state != 2,
+        });
+        app.on_agent(AgentEvent::ContextUsage {
+            tokens: 1234,
+            limit: cfg.context_tokens,
+        });
+        if state >= 3 {
+            app.on_agent(AgentEvent::UsageStart);
+        }
+        if state == 3 {
+            app.persist_current_session().unwrap();
+        } else {
+            app.on_agent(AgentEvent::Done(vec![
+                json!({"role": "assistant", "content": "answer"}),
+            ]));
+        }
+        drop(app);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = App::new(cfg, tx).unwrap();
+        for switched in [false, true] {
+            if switched {
+                restored.command("/clear");
+                assert_eq!(restored.token_usage, ChatUsage::default());
+                assert_eq!(restored.context_tokens, 0);
+                assert!(restored.switch_session(&id).unwrap());
+            }
+            assert_eq!(restored.token_usage.prompt_tokens, 10);
+            assert_eq!(restored.token_usage.completion_tokens, 4);
+            assert_eq!(restored.token_usage.total_tokens, 14);
+            assert_eq!(restored.token_usage.cached_tokens, 0);
+            assert!(restored.token_usage.has_usage);
+            assert_eq!(restored.token_usage.has_cache, state != 1);
+            assert_eq!(restored.token_usage.is_complete(), state < 2);
+            assert_eq!(restored.token_usage.cache_is_complete(), state == 0);
+            assert_eq!(restored.context_tokens, 1234);
+        }
+        restored.on_agent(AgentEvent::UsageStart);
+        restored.on_agent(AgentEvent::Usage {
+            usage: usage(5, 2, Some(1)),
+            complete: true,
+        });
+        assert_eq!(restored.token_usage.total_tokens, 21);
+        assert_eq!(restored.token_usage.cached_tokens, 1);
+        assert_eq!(restored.token_usage.is_complete(), state < 2);
+    }
+}
+
+#[test]
+fn token_usage_is_autosaved_before_history_changes() {
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let mut cfg = config();
+    cfg.config_dir = dir.path().to_path_buf();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(cfg.clone(), tx).unwrap();
+    app.on_agent(AgentEvent::UsageStart);
+    app.on_agent(AgentEvent::Usage {
+        usage: usage(10, 4, Some(2)),
+        complete: true,
+    });
+    app.on_agent(AgentEvent::ContextUsage {
+        tokens: 800,
+        limit: cfg.context_tokens,
+    });
+    drop(app);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let restored = App::new(cfg, tx).unwrap();
+    assert_eq!(restored.token_usage.total_tokens, 14);
+    assert_eq!(restored.token_usage.cached_tokens, 2);
+    assert!(restored.token_usage.is_complete());
+    assert_eq!(restored.context_tokens, 800);
+}
+
+#[test]
+fn token_usage_is_unknown_for_legacy_sessions() {
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let mut cfg = config();
+    cfg.config_dir = dir.path().to_path_buf();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(cfg.clone(), tx).unwrap();
+    app.history = vec![json!({"role": "user", "content": "legacy history"})];
+    app.persist_current_session().unwrap();
+    let path = dir
+        .path()
+        .join("sessions")
+        .join(format!("{}.json", app.session.id));
+    drop(app);
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved.as_object_mut().unwrap().remove("token_usage");
+    saved.as_object_mut().unwrap().remove("context_tokens");
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let restored = App::new(cfg, tx).unwrap();
+    assert_eq!(restored.token_usage, ChatUsage::default());
+    assert!(!restored.token_usage.is_complete());
+    assert!(restored.context_tokens > 0);
+    assert_eq!(restored.history[0]["content"], "legacy history");
 }
 
 #[test]
