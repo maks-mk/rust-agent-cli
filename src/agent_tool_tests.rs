@@ -1,6 +1,46 @@
 use super::*;
 
 #[tokio::test]
+async fn file_tools_accept_absolute_workspace_paths_and_return_relative_paths() {
+    let api = MockApi::start(vec![]).await;
+    let absolute = api
+        .cfg
+        .root
+        .join("absolute.txt")
+        .to_string_lossy()
+        .to_string();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let auto = Arc::new(AtomicBool::new(true));
+    let (status, _, result) = write_file(
+        "write",
+        &json!({"path":absolute, "content":"before\n"}),
+        &api.cfg,
+        &tx,
+        &auto,
+    )
+    .await;
+    assert_eq!(status, ToolStatus::Ok, "{result}");
+    assert_eq!(result, "Wrote 1 lines to absolute.txt.");
+    let (status, _, content) = read_file(&json!({"path":absolute}), &api.cfg).await;
+    assert_eq!(status, ToolStatus::Ok, "{content}");
+    assert_eq!(content, "before\n");
+    let (status, _, result) = edit_file(
+        "edit",
+        &json!({"path":absolute, "old_string":"before", "new_string":"after"}),
+        &api.cfg,
+        &tx,
+        &auto,
+    )
+    .await;
+    assert_eq!(status, ToolStatus::Ok, "{result}");
+    assert!(result.starts_with("Edited absolute.txt:"), "{result}");
+    assert!(!result.contains(&absolute), "{result}");
+    let (status, _, content) = read_file(&json!({"path":"absolute.txt"}), &api.cfg).await;
+    assert_eq!(status, ToolStatus::Ok);
+    assert_eq!(content, "after\n");
+}
+
+#[tokio::test]
 async fn write_file_reports_line_count_without_emitting_content_to_history() {
     let api = MockApi::start(vec![]).await;
     let cfg = &api.cfg;

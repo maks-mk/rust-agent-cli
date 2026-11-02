@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "rust-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",

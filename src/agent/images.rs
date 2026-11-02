@@ -23,7 +23,7 @@ pub(super) fn tool_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "paths": {
-                        "description": "One workspace-relative file path, or a list of up to four paths.",
+                        "description": "One workspace-relative file path, or a list of up to four paths, e.g. 'images/screenshot.png'. Do not prepend the Workspace directory or use absolute paths.",
                         "anyOf": [
                             {"type": "string", "minLength": 1},
                             {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": MAX_IMAGES}

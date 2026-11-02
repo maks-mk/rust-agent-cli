@@ -817,6 +817,8 @@ fn tool_ui_survives_restart_and_session_switch_without_raw_results() {
         diff: vec![DiffLine {
             kind: agent::DiffKind::Context,
             text: "$ npm test".into(),
+            old_line: None,
+            new_line: None,
         }],
     });
     app.on_agent(AgentEvent::ToolOutput {

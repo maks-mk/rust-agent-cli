@@ -10,6 +10,8 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Pa
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
+mod diff;
+
 // Inherit the terminal palette outside deliberately shaded controls.
 #[cfg(test)]
 const BACKGROUND: Color = Color::Reset;
@@ -588,7 +590,10 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
             } else {
                 t.diff.as_slice()
             };
-            for d in diff {
+            if t.label == "Edit" {
+                v.extend(self::diff::render(diff, width));
+            }
+            for d in diff.iter().filter(|_| t.label != "Edit") {
                 let (text, style) = match d.kind {
                     DiffKind::Add => (format!("+ {}", d.text), fg(OK)),
                     DiffKind::Del => (format!("- {}", d.text), fg(ERR)),

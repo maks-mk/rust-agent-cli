@@ -288,6 +288,8 @@ fn shell_preview_is_not_duplicated_and_states_are_explicit() {
             diff: vec![DiffLine {
                 kind: DiffKind::Context,
                 text: "$ echo unique-command".into(),
+                old_line: None,
+                new_line: None,
             }],
             result: Some("result-marker".into()),
             output: Some("exit code: 0\nshell-output-marker".into()),
@@ -676,10 +678,14 @@ fn write_file_history_hides_saved_content_previews() {
             DiffLine {
                 kind: DiffKind::Add,
                 text: "private new content".into(),
+                old_line: None,
+                new_line: None,
             },
             DiffLine {
                 kind: DiffKind::Del,
                 text: "private old content".into(),
+                old_line: None,
+                new_line: None,
             },
         ],
         result: Some("Writed 1 lines".into()),
@@ -688,6 +694,65 @@ fn write_file_history_hides_saved_content_previews() {
     let screen = render(&mut app, 90, 20).join("\n");
     assert!(screen.contains("Writed 1 lines"), "{screen}");
     assert!(!screen.contains("private"), "{screen}");
+}
+
+#[test]
+fn edit_file_history_renders_numbered_columns_and_survives_resize() {
+    let mut app = app();
+    app.entries = vec![Entry::Tool(ToolEntry {
+        id: "edit".into(),
+        label: "Edit".into(),
+        target: "theme.py".into(),
+        status: ToolStatus::Ok,
+        diff: vec![
+            DiffLine {
+                kind: DiffKind::More,
+                text: "204 unmodified lines".into(),
+                old_line: Some(294),
+                new_line: Some(295),
+            },
+            DiffLine {
+                kind: DiffKind::Del,
+                text: "border: none;".into(),
+                old_line: Some(295),
+                new_line: None,
+            },
+            DiffLine {
+                kind: DiffKind::Add,
+                text: "border: 1px solid BORDER;".into(),
+                old_line: None,
+                new_line: Some(296),
+            },
+        ],
+        result: Some("Edited · 1 occurrence · +1 −1".into()),
+        output: None,
+    })];
+    let wide = render_buffer(&mut app, 110, 20);
+    let rows = buffer_rows(&wide);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("border: none;") && row.contains("border: 1px solid BORDER;")),
+        "{rows:?}"
+    );
+    assert_text_style(&wide, "204 unmodified lines", MUTED, Color::Rgb(46, 46, 46));
+    assert!(rows.iter().any(|row| row.contains("Edit [done]  theme.py")));
+    let narrow = render(&mut app, 45, 25);
+    assert!(
+        narrow
+            .iter()
+            .any(|row| row.contains("295     - border: none;")),
+        "{narrow:?}"
+    );
+    assert!(
+        narrow
+            .iter()
+            .any(|row| row.contains("296 + border: 1px solid BORDER;")),
+        "{narrow:?}"
+    );
+    let wide_again = render(&mut app, 110, 20);
+    assert!(wide_again
+        .iter()
+        .any(|row| row.contains("border: none;") && row.contains("border: 1px solid BORDER;")));
 }
 
 #[test]

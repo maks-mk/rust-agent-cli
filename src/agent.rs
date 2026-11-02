@@ -205,6 +205,10 @@ pub enum DiffKind {
 pub struct DiffLine {
     pub kind: DiffKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_line: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -439,6 +443,8 @@ struct ToolCall {
 
 // ───────────────────────────── prompts & schema ─────────────────────────────
 
+const WORKSPACE_PATH_DESCRIPTION: &str = "Path relative to the workspace, e.g. 'src/main.rs'. Do not include the Workspace directory, a drive letter, or a leading slash.";
+
 fn system_prompt(cfg: &Config) -> String {
     format!(
         "You are a concise terminal coding assistant. Write all user-facing prose (including \
@@ -457,6 +463,8 @@ fn system_prompt(cfg: &Config) -> String {
          summary-only file state before editing.\n\
          * Use `rg --files` to locate files and `rg -n` with path/glob filters to search text; \
          read matched ranges. Fall back to native search only if rg is unavailable.\n\
+         * File tools use workspace-relative paths, e.g. `src/main.rs`; never prepend the \
+         Workspace directory or use absolute paths.\n\
          * Read before editing; preserve unrelated work and conventions; fix root causes \
          minimally; prefer targeted edits and reuse existing dependencies. After a successful \
          `edit_file`, rely on the applied diff in its result; re-read only if it was truncated \
@@ -481,11 +489,11 @@ pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a UTF-8 text file from the workspace.",
+                "description": "Read a UTF-8 text file using a workspace-relative path, e.g. src/main.rs. Do not prepend the Workspace directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the working directory." },
+                        "path": { "type": "string", "description": WORKSPACE_PATH_DESCRIPTION },
                         "offset": { "type": "integer", "minimum": 1, "description": "1-based line to start from (optional)." },
                         "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to return (optional, default 2000)." }
                     },
@@ -502,7 +510,7 @@ pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the working directory." },
+                        "path": { "type": "string", "description": WORKSPACE_PATH_DESCRIPTION },
                         "content": { "type": "string", "description": "The complete new file content." }
                     },
                     "required": ["path", "content"]
@@ -517,7 +525,7 @@ pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the working directory." },
+                        "path": { "type": "string", "description": WORKSPACE_PATH_DESCRIPTION },
                         "old_string": { "type": "string", "description": "The exact text to find. Must occur exactly once (or use replace_all). Empty string is not allowed." },
                         "new_string": { "type": "string", "description": "The replacement text (may be empty to delete the match)." },
                         "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)." }
@@ -1892,11 +1900,7 @@ async fn write_file(
     let (diff, _, _) = full_diff(old, content);
     let review = file_review(&diff, old, content);
 
-    let rel = full
-        .strip_prefix(&cfg.root)
-        .unwrap_or(&full)
-        .display()
-        .to_string();
+    let rel = workspace_path_label(&cfg.root, &full);
     let n_lines = content.lines().count();
 
     if !auto.load(Ordering::Relaxed) {
@@ -2005,11 +2009,7 @@ async fn edit_file(
         diff,
     });
 
-    let rel = full
-        .strip_prefix(&cfg.root)
-        .unwrap_or(&full)
-        .display()
-        .to_string();
+    let rel = workspace_path_label(&cfg.root, &full);
     let noun = if replace_all {
         format!("{matches} occurrences")
     } else {
@@ -2261,6 +2261,8 @@ fn shell_preview(command: &str) -> Vec<DiffLine> {
         .map(|l| DiffLine {
             kind: DiffKind::Context,
             text: format!("$ {}", truncate_shell_ui_arg(l)),
+            old_line: None,
+            new_line: None,
         })
         .collect();
     if command.lines().count() > SHELL_DIFF_LINES {
@@ -2269,6 +2271,8 @@ fn shell_preview(command: &str) -> Vec<DiffLine> {
             text: format!(
                 "{SHELL_UI_CUT_MARKER} preview truncated; review the full command in the approval dialog"
             ),
+            old_line: None,
+            new_line: None,
         });
     }
     diff
@@ -2648,7 +2652,18 @@ async fn shell_output(command: &str, root: &Path, deadline: Duration) -> Result<
 /// Resolve `p` against the canonical workspace root and reject paths that
 /// escape it or traverse a symbolic link.
 fn resolve(root: &Path, p: &str) -> std::result::Result<PathBuf, String> {
+    #[cfg(windows)]
+    let normalized = p.replace('/', "\\");
+    #[cfg(windows)]
+    let p = Path::new(&normalized);
+    #[cfg(not(windows))]
     let p = Path::new(p);
+    if p.as_os_str().is_empty()
+        || (!p.is_absolute()
+            && (p.has_root() || matches!(p.components().next(), Some(Component::Prefix(_)))))
+    {
+        return Err(format!("invalid workspace path: {}. Use a relative path such as 'src/main.rs', without a drive letter or leading slash.", p.display()));
+    }
     let root_real =
         std::fs::canonicalize(root).map_err(|e| format!("cannot resolve workspace root: {e}"))?;
     let joined = if p.is_absolute() {
@@ -2668,16 +2683,16 @@ fn resolve(root: &Path, p: &str) -> std::result::Result<PathBuf, String> {
         }
     }
 
-    if !out.starts_with(&root_real) {
-        return Err(format!("path is outside the workspace: {}", p.display()));
-    }
+    let relative = workspace_relative_path(&out, &root_real).ok_or_else(|| {
+        format!("path is outside the workspace: {}. Use a path relative to the Workspace directory, e.g. 'src/main.rs'.", p.display())
+    })?;
+    // Rebuild from the canonical root so plain Windows drive/UNC paths and
+    // their verbatim forms resolve identically, including files not yet created.
+    out = root_real.join(&relative);
 
     // Reject symlinks in every existing path component. A lexical `starts_with`
     // check alone is insufficient: a symlink under the workspace can point out
     // of it and let read/write tools access an external file.
-    let relative = out
-        .strip_prefix(&root_real)
-        .map_err(|_| format!("path is outside the workspace: {}", p.display()))?;
     let mut current = root_real.clone();
     for component in relative.components() {
         current.push(component.as_os_str());
@@ -2703,7 +2718,7 @@ fn resolve(root: &Path, p: &str) -> std::result::Result<PathBuf, String> {
     // inside the canonical workspace. The symlink walk above also protects
     // paths that do not exist yet but may be created by write_file.
     if let Ok(real_target) = std::fs::canonicalize(&out) {
-        if !real_target.starts_with(&root_real) {
+        if workspace_relative_path(&real_target, &root_real).is_none() {
             return Err(format!(
                 "path resolves outside the workspace: {}",
                 p.display()
@@ -2714,52 +2729,110 @@ fn resolve(root: &Path, p: &str) -> std::result::Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Full changed block with context, without the chat preview's line limit.
-fn full_diff(old: Option<&str>, new: &str) -> (Vec<DiffLine>, usize, usize) {
-    let new_l: Vec<&str> = new.lines().collect();
-    let old_l: Vec<&str> = old.map(|o| o.lines().collect()).unwrap_or_default();
-
-    let mut p = 0;
-    while p < old_l.len() && p < new_l.len() && old_l[p] == new_l[p] {
-        p += 1;
-    }
-    let mut s = 0;
-    while s < old_l.len() - p
-        && s < new_l.len() - p
-        && old_l[old_l.len() - 1 - s] == new_l[new_l.len() - 1 - s]
+/// Compare whole path components; Windows accepts both ordinary and verbatim
+/// prefixes and treats drive letters and component casing alike.
+fn workspace_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    #[cfg(not(windows))]
     {
-        s += 1;
+        path.strip_prefix(root).ok().map(Path::to_path_buf)
     }
+    #[cfg(windows)]
+    {
+        fn ordinary(path: &Path) -> PathBuf {
+            let raw = path.to_string_lossy().replace('/', "\\");
+            if let Some(rest) = raw.strip_prefix(r"\\?\") {
+                if rest
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
+                {
+                    PathBuf::from(format!(r"\\{}", &rest[4..]))
+                } else {
+                    PathBuf::from(rest)
+                }
+            } else {
+                PathBuf::from(raw)
+            }
+        }
+        let path = ordinary(path);
+        let root = ordinary(root);
+        let mut components = path.components();
+        for expected in root.components() {
+            let actual = components.next()?;
+            if !actual
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+            {
+                return None;
+            }
+        }
+        Some(components.collect())
+    }
+}
 
-    let removed = &old_l[p..old_l.len() - s];
-    let added = &new_l[p..new_l.len() - s];
+fn workspace_path_label(root: &Path, path: &Path) -> String {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|root| workspace_relative_path(path, &root))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
-    let mut out: Vec<DiffLine> = Vec::new();
-    let line = |kind: DiffKind, t: &str| DiffLine {
-        kind,
-        text: t.to_string(),
+/// All changed hunks with numbered context; fold unchanged ranges between them.
+fn full_diff(old: Option<&str>, new: &str) -> (Vec<DiffLine>, usize, usize) {
+    let diff = TextDiff::configure()
+        .timeout(Duration::from_millis(200))
+        .diff_lines(old.unwrap_or_default(), new);
+    let mut out = Vec::new();
+    let (mut added, mut removed) = (0, 0);
+    let (mut old_end, mut new_end) = (0, 0);
+    let folded = |count, old_line, new_line| DiffLine {
+        kind: DiffKind::More,
+        text: format!("{count} unmodified lines"),
+        old_line: Some(old_line),
+        new_line: Some(new_line),
     };
-
-    if old.is_some() {
-        for l in &old_l[p.saturating_sub(2)..p] {
-            out.push(line(DiffKind::Context, l));
+    for group in diff.grouped_ops(1) {
+        let first = group.first().unwrap();
+        let gap = first.old_range().start - old_end;
+        if gap > 0 {
+            out.push(folded(
+                gap,
+                first.old_range().start,
+                first.new_range().start,
+            ));
         }
-    }
-    for l in removed {
-        out.push(line(DiffKind::Del, l));
-    }
-    for l in added {
-        out.push(line(DiffKind::Add, l));
-    }
-    if old.is_some() {
-        let tail_start = old_l.len() - s;
-        let tail_end = (tail_start + 2).min(old_l.len());
-        for l in &old_l[tail_start..tail_end] {
-            out.push(line(DiffKind::Context, l));
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let kind = match change.tag() {
+                    ChangeTag::Delete => {
+                        removed += 1;
+                        DiffKind::Del
+                    }
+                    ChangeTag::Insert => {
+                        added += 1;
+                        DiffKind::Add
+                    }
+                    ChangeTag::Equal => DiffKind::Context,
+                };
+                out.push(DiffLine {
+                    kind,
+                    text: change.value().trim_end_matches(['\r', '\n']).to_string(),
+                    old_line: change.old_index().map(|i| i + 1),
+                    new_line: change.new_index().map(|i| i + 1),
+                });
+            }
         }
+        let last = group.last().unwrap();
+        old_end = last.old_range().end;
+        new_end = last.new_range().end;
     }
-
-    (out, added.len(), removed.len())
+    let remaining = diff.old_slices().len() - old_end;
+    if remaining > 0 {
+        out.push(folded(remaining, old_end + remaining, new_end + remaining));
+    }
+    (out, added, removed)
 }
 
 fn edit_file_diff(old: &str, new: &str) -> (String, usize, usize) {
@@ -2852,16 +2925,51 @@ fn file_review(diff: &[DiffLine], old: Option<&str>, new: &str) -> String {
     review
 }
 
-fn make_diff(mut out: Vec<DiffLine>) -> Vec<DiffLine> {
-    if out.len() > MAX_DIFF_LINES {
-        let extra = out.len() - MAX_DIFF_LINES;
-        out.truncate(MAX_DIFF_LINES);
-        out.push(DiffLine {
-            kind: DiffKind::More,
-            text: format!("… {extra} more lines; full diff in approval dialog"),
-        });
+fn make_diff(out: Vec<DiffLine>) -> Vec<DiffLine> {
+    if out.len() <= MAX_DIFF_LINES {
+        return out;
     }
-    out
+    let mut preview = Vec::with_capacity(MAX_DIFF_LINES + 1);
+    let mut i = 0;
+    while i < out.len() && preview.len() < MAX_DIFF_LINES {
+        if !matches!(out[i].kind, DiffKind::Add | DiffKind::Del) {
+            preview.push(out[i].clone());
+            i += 1;
+            continue;
+        }
+        let end = out[i..]
+            .iter()
+            .position(|line| !matches!(line.kind, DiffKind::Add | DiffKind::Del))
+            .map_or(out.len(), |offset| i + offset);
+        let mut old = out[i..end].iter().filter(|line| line.kind == DiffKind::Del);
+        let mut new = out[i..end].iter().filter(|line| line.kind == DiffKind::Add);
+        // Keep both sides visible even if a large replacement is truncated.
+        loop {
+            let (left, right) = (old.next(), new.next());
+            if left.is_none() && right.is_none() {
+                break;
+            }
+            for line in [left, right].into_iter().flatten() {
+                if preview.len() < MAX_DIFF_LINES {
+                    preview.push(line.clone());
+                }
+            }
+            if preview.len() == MAX_DIFF_LINES {
+                break;
+            }
+        }
+        i = end;
+    }
+    preview.push(DiffLine {
+        kind: DiffKind::More,
+        text: format!(
+            "… {} more lines; full diff in approval dialog",
+            out.len() - preview.len()
+        ),
+        old_line: None,
+        new_line: None,
+    });
+    preview
 }
 
 #[cfg(test)]
