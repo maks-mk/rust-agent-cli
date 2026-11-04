@@ -1,0 +1,28 @@
+rust-agent: a terminal coding agent for any OpenAI-compatible API
+
+USAGE:
+    rust-agent [--model <name>] [--base-url <url>]
+
+ENVIRONMENT (or a .env file next to the executable):
+    OPENAI_API_KEY    API key (optional for local servers such as Ollama)
+    OPENAI_BASE_URL   default: https://api.openai.com/v1
+    OPENAI_MODEL      default: gpt-4o-mini
+    API_MODE          chat (default) or responses
+    REASONING_EFFORT  optional thinking level (e.g. low, medium, high);
+                      sent in the format expected by API_MODE (chat/responses)
+    REASONING_EFFORTS comma-separated levels cycled with Tab
+                      (default: none,minimal,low,medium,high,xhigh,max);
+                      which levels a model accepts is up to the provider
+    AGENT_MAX_STEPS   max tool steps per turn (default: 25)
+    AGENT_CONTEXT_TOKENS
+                      context compression threshold in tokens
+                      (default: 100000; 0 disables compression)
+    AGENT_AUTO_APPROVE
+                      initial auto-approval mode: on/off (default: off)
+    RUST_AGENT_ASCII  set to 1 to force ASCII-only UI glyphs (default: Unicode)
+
+.env is loaded only next to the executable and overrides inherited environment
+variables. Command-line flags take precedence over .env.
+
+The agent reads and writes files inside the current workspace. Use /workspace <path>
+to switch workspace; shell commands run there and need approval (see /auto).

@@ -11,6 +11,7 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -23,6 +24,10 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 mod images;
 use images::{is_image_message, read_images, text_only_message};
+mod json_size;
+use json_size::{json_len, VisibleMessage};
+mod request;
+use request::completion_request;
 
 pub const DEFAULT_MAX_STEPS: usize = 25;
 pub const DEFAULT_CONTEXT_TOKENS: usize = 100_000;
@@ -355,13 +360,14 @@ struct Completion {
 }
 
 impl Completion {
-    fn assistant_message(&self) -> Value {
-        let mut message = json!({ "role": "assistant", "content": self.text });
+    fn take_assistant_message(&mut self) -> Value {
+        let mut message = json!({ "role": "assistant" });
+        message["content"] = Value::String(std::mem::take(&mut self.text));
         if !self.reasoning.is_empty() {
-            message["reasoning_content"] = json!(self.reasoning);
+            message["reasoning_content"] = Value::String(std::mem::take(&mut self.reasoning));
         }
-        if let Some(items) = &self.responses_output_items {
-            message["responses_output_items"] = json!(items);
+        if let Some(items) = self.responses_output_items.take() {
+            message["responses_output_items"] = Value::Array(items);
         }
         if !self.calls.is_empty() {
             message["tool_calls"] = self
@@ -397,7 +403,7 @@ impl ToolBatch<'_> {
     }
 
     fn record(&mut self, index: usize, call: &ToolCall, output: ToolOutput) {
-        self.history[self.first_result + index]["content"] = json!(output.content);
+        self.history[self.first_result + index]["content"] = Value::String(output.content);
         if !output.images.is_empty() {
             let mut parts = vec![json!({
                 "type": "text",
@@ -604,10 +610,12 @@ pub async fn run_turn(
                 });
             }
         }
-        let mut messages = vec![system.clone()];
-        messages.extend(history.iter().cloned());
+        let mut messages = Vec::with_capacity(history.len() + 1);
+        messages.push(&system);
+        messages.extend(history.iter());
 
-        let completion = completion_with_retries(client, cfg, &messages, Some(&tools), tx).await?;
+        let mut completion =
+            completion_with_retries(client, cfg, &messages, Some(&tools), tx).await?;
         if let Some(usage) = completion.usage {
             measured = Some((estimate_history(&history), usage.prompt_tokens as usize));
         }
@@ -615,7 +623,7 @@ pub async fn run_turn(
             || !completion.reasoning.is_empty()
             || !completion.calls.is_empty()
         {
-            history.push(completion.assistant_message());
+            history.push(completion.take_assistant_message());
         }
         if completion.calls.is_empty() {
             let _ = tx.send(AgentEvent::ContextUsage {
@@ -698,11 +706,7 @@ fn estimate_tokens(value: &Value) -> usize {
     // same visible text/tool calls also exist in the internal chat-shaped record.
     // Estimate from that record, not the duplicated raw payload/encrypted reasoning.
     if value.get("responses_output_items").is_some() {
-        let mut visible = value.clone();
-        if let Some(object) = visible.as_object_mut() {
-            object.remove("responses_output_items");
-        }
-        return visible.to_string().len().div_ceil(3);
+        return json_len(&VisibleMessage(value.as_object().unwrap())).div_ceil(3);
     }
     if is_image_message(value) {
         let count = value["content"]
@@ -713,9 +717,9 @@ fn estimate_tokens(value: &Value) -> usize {
             .count();
         // Vision tokens are provider-dependent, not proportional to base64 length.
         // Actual prompt usage calibrates this provisional estimate after a response.
-        return text_only_message(value).to_string().len().div_ceil(3) + count.saturating_mul(4096);
+        return json_len(&text_only_message(value)).div_ceil(3) + count.saturating_mul(4096);
     }
-    value.to_string().len().div_ceil(3)
+    json_len(value).div_ceil(3)
 }
 
 const CONTEXT_SUMMARY_PREFIX: &str =
@@ -819,14 +823,15 @@ async fn compress_context(
 
     let _ = tx.send(AgentEvent::ContextCompression { active: true });
     let _status = CompressionStatus(tx);
-    let messages = vec![
+    let messages = [
         json!({"role": "system", "content": CONTEXT_COMPRESSION_PROMPT}),
         json!({"role": "user", "content": serde_json::to_string(&json!({
             "latest_user_request": latest_user.map(|index| &history[index]["content"]),
             "messages_to_summarize": older,
         }))?}),
     ];
-    let completion = completion_with_retries(client, cfg, &messages, None, tx)
+    let message_refs = messages.each_ref();
+    let completion = completion_with_retries(client, cfg, &message_refs, None, tx)
         .await
         .map_err(|error| anyhow!("context compression failed: {error}"))?;
     let text = completion.text.trim();
@@ -956,7 +961,7 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 async fn completion_with_retries(
     client: &reqwest::Client,
     cfg: &Config,
-    messages: &[Value],
+    messages: &[&Value],
     tools: Option<&Value>,
     tx: &Tx,
 ) -> Result<Completion> {
@@ -1009,7 +1014,7 @@ fn responses_content(role: &str, content: &Value) -> Value {
     )
 }
 
-fn responses_input(messages: &[Value]) -> Vec<Value> {
+fn responses_input<'a>(messages: impl IntoIterator<Item = &'a Value>) -> Vec<Cow<'a, Value>> {
     let mut input = Vec::new();
     for message in messages {
         let role = message["role"].as_str().unwrap_or("user");
@@ -1020,40 +1025,38 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
                 .get("responses_output_items")
                 .and_then(Value::as_array)
             {
-                input.extend(items.iter().cloned());
+                input.extend(items.iter().map(Cow::Borrowed));
                 continue;
             }
             if let Some(content) = message.get("content") {
                 if !content.is_null() && content.as_str() != Some("") {
-                    input.push(json!({
-                        "role": "assistant",
-                        "content": responses_content(role, content)
-                    }));
+                    let mut converted = json!({"role": "assistant"});
+                    converted["content"] = responses_content(role, content);
+                    input.push(Cow::Owned(converted));
                 }
             }
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
-                    input.push(json!({
+                    input.push(Cow::Owned(json!({
                         "type": "function_call",
                         "call_id": call["id"],
                         "name": call["function"]["name"],
                         "arguments": call["function"]["arguments"].as_str().unwrap_or("{}")
-                    }));
+                    })));
                 }
             }
         } else if role == "tool" {
-            input.push(json!({
+            input.push(Cow::Owned(json!({
                 "type": "function_call_output",
                 "call_id": message["tool_call_id"],
                 "output": message["content"].as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| message["content"].to_string())
-            }));
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(message["content"].to_string()))
+            })));
         } else {
-            input.push(json!({
-                "role": role,
-                "content": responses_content(role, &message["content"])
-            }));
+            let mut converted = json!({"role": role});
+            converted["content"] = responses_content(role, &message["content"]);
+            input.push(Cow::Owned(converted));
         }
     }
     input
@@ -1129,53 +1132,18 @@ fn response_tool_calls(output: &[Value]) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
-fn completion_request(cfg: &Config, messages: &[Value], tools: Option<&Value>) -> (String, Value) {
-    match cfg.api_mode {
-        ApiMode::Chat => {
-            let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-            let mut body = json!({
-                "model": cfg.model,
-                "messages": messages,
-                "stream": true,
-                "stream_options": { "include_usage": true }
-            });
-            if let Some(tools) = tools {
-                body["tools"] = tools.clone();
-            }
-            if let Some(effort) = &cfg.reasoning_effort {
-                body["reasoning_effort"] = json!(effort);
-            }
-            (url, body)
-        }
-        ApiMode::Responses => {
-            let url = format!("{}/responses", cfg.base_url.trim_end_matches('/'));
-            let mut body = json!({
-                "model": cfg.model,
-                "input": responses_input(messages),
-                "stream": true,
-                "store": false
-            });
-            if let Some(tools) = tools {
-                body["tools"] = responses_tools(tools);
-            }
-            if let Some(effort) = &cfg.reasoning_effort {
-                body["reasoning"] = json!({ "effort": effort });
-            }
-            (url, body)
-        }
-    }
-}
-
 async fn stream_completion(
     client: &reqwest::Client,
     cfg: &Config,
-    messages: &[Value],
+    messages: &[&Value],
     tools: Option<&Value>,
     tx: &Tx,
 ) -> Result<Completion> {
-    let (url, body) = completion_request(cfg, messages, tools);
-
-    let mut req = client.post(&url).json(&body);
+    let mut req = {
+        let (url, body) = completion_request(cfg, messages, tools);
+        // reqwest owns the serialized bytes; release converted Responses input now.
+        client.post(url).json(&body)
+    };
     if !cfg.api_key.is_empty() {
         req = req.bearer_auth(&cfg.api_key);
     }
@@ -1242,20 +1210,19 @@ async fn stream_completion(
             if !part.ends_with(b"\n") {
                 continue;
             }
-            let line = String::from_utf8_lossy(&buf).trim().to_string();
-            buf.clear();
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
+            let parsed = {
+                let line = String::from_utf8_lossy(&buf);
+                match line.trim().strip_prefix("data:").map(str::trim) {
+                    Some("[DONE]") => {
+                        finished = true;
+                        break 'outer;
+                    }
+                    Some(data) if !data.is_empty() => serde_json::from_str::<Value>(data).ok(),
+                    _ => None,
+                }
             };
-            let data = data.trim();
-            if data == "[DONE]" {
-                finished = true;
-                break 'outer;
-            }
-            if data.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(data) else {
+            buf.clear();
+            let Some(mut v) = parsed else {
                 continue;
             };
 
@@ -1293,16 +1260,18 @@ async fn stream_completion(
                         }
                     }
                     "response.completed" => {
-                        if let Some(output) = v["response"]["output"].as_array() {
-                            responses_output_items = Some(output.clone());
-                            calls = response_tool_calls(output)?;
+                        if let Some(Value::Array(output)) =
+                            v.pointer_mut("/response/output").map(Value::take)
+                        {
+                            calls = response_tool_calls(&output)?;
                             // Some compatible endpoints send only the completed event.
                             if text.is_empty() {
-                                text = response_output_text(output);
+                                text = response_output_text(&output);
                                 if tools.is_some() && !text.is_empty() {
                                     let _ = tx.send(AgentEvent::Text(text.clone()));
                                 }
                             }
+                            responses_output_items = Some(output);
                         }
                         finished = true;
                     }
@@ -2978,3 +2947,9 @@ mod streaming_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod performance;
+
+#[cfg(test)]
+mod performance_tests;

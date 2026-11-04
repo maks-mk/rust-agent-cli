@@ -1,0 +1,12 @@
+
+running 1 test
+test agent::performance::profile ... PROFILE plain allocations=387 reallocations=18 allocated_bytes=143694 retained_delta_bytes=0
+PROFILE history_30 allocations=532 reallocations=34 allocated_bytes=5817146 retained_delta_bytes=0
+PROFILE tools_3 allocations=1110 reallocations=226 allocated_bytes=1080465 retained_delta_bytes=0
+PROFILE stream_2048 allocations=22904 reallocations=30 allocated_bytes=4401735 retained_delta_bytes=0
+PROFILE large_json allocations=777 reallocations=40 allocated_bytes=2213093 retained_delta_bytes=0
+PROFILE requests_100 allocations=38502 reallocations=1800 allocated_bytes=12510576 retained_delta_bytes=0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 152 filtered out; finished in 0.89s
+

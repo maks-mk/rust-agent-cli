@@ -1,6 +1,6 @@
 [package]
 name = "rust-agent"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "A small terminal (TUI) coding agent for any OpenAI-compatible API"
 
@@ -23,6 +23,16 @@ unicode-width = "0.2"
 
 [build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+dhat = "0.3"
+stats_alloc = "0.1"
+
+[features]
+# Allocators are enabled only in test binaries, never in the application.
+profile-allocations = []
+profile-heap = []
 
 [profile.release]
 opt-level = 3

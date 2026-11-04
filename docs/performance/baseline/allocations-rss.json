@@ -1,0 +1,6 @@
+{
+  "run": "allocations",
+  "observed_peak_working_set_bytes": 19546112,
+  "sampled_peak_private_bytes": 12734464,
+  "sampling_interval_ms": 20
+}

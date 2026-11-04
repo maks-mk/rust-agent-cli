@@ -1,0 +1,6 @@
+{
+  "run": "timing",
+  "observed_peak_working_set_bytes": 20959232,
+  "sampled_peak_private_bytes": 16609280,
+  "sampling_interval_ms": 20
+}

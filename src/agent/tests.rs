@@ -15,7 +15,7 @@ fn api_mode_defaults_to_chat_and_accepts_only_chat_or_responses() {
 
 #[test]
 fn responses_request_translates_messages_and_function_tools() {
-    let messages = vec![
+    let messages = [
         json!({"role":"system", "content":"instructions"}),
         json!({"role":"user", "content":[
             {"type":"text", "text":"inspect this"},
@@ -44,7 +44,9 @@ fn responses_request_translates_messages_and_function_tools() {
         context_tokens: DEFAULT_CONTEXT_TOKENS,
         auto_approve: false,
     };
-    let (url, body) = completion_request(&cfg, &messages, Some(&tools));
+    let message_refs = messages.each_ref();
+    let (url, body) = completion_request(&cfg, &message_refs, Some(&tools));
+    let body = serde_json::to_value(body).unwrap();
     assert_eq!(url, "https://example.invalid/v1/responses");
     assert!(body.get("messages").is_none());
     assert_eq!(body["input"][0]["role"], "system");

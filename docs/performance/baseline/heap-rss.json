@@ -1,0 +1,6 @@
+{
+  "run": "heap",
+  "observed_peak_working_set_bytes": 20430848,
+  "sampled_peak_private_bytes": 9183232,
+  "sampling_interval_ms": 20
+}

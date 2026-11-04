@@ -1124,6 +1124,38 @@ fn sse(chunks: Vec<Value>) -> String {
     body
 }
 
+#[tokio::test]
+async fn sse_buffer_handles_unicode_crlf_ignored_lines_and_chunk_boundaries() {
+    let response = format!(
+        ": comment\r\nevent: message\r\ndata: invalid JSON\r\n\r\ndata: {}\r\n\r\ndata: \r\ndata: {}\n\ndata: [DONE]\r\n\r\n",
+        delta(json!({"content":"Привет 🙂\n"})),
+        delta(json!({"content":"世界", "reasoning_content":"мысль"}))
+    );
+    for size in [1, 2, 3, 7, 64, 4096] {
+        let mut api = MockApi::start_with_options(vec![response.clone()], 200, size, false).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let completion = stream_completion(
+            &reqwest::Client::new(),
+            &api.cfg,
+            &[],
+            Some(&json!([])),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.text, "Привет 🙂\n世界", "chunk size {size}");
+        assert_eq!(completion.reasoning, "мысль");
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        }
+        assert_eq!(streamed, completion.text);
+        assert_eq!(api.requests().await.len(), 1);
+    }
+}
+
 fn delta(value: Value) -> Value {
     json!({"choices": [{"delta": value}], "usage": null})
 }
@@ -1157,16 +1189,16 @@ async fn responses_mode_streams_text_tools_usage_and_reuses_output_items() {
     ]);
     let mut api = MockApi::start(vec![response]).await;
     api.cfg.api_mode = crate::agent::ApiMode::Responses;
-    let messages = vec![json!({"role":"user", "content":"read note.txt"})];
+    let messages = [json!({"role":"user", "content":"read note.txt"})];
     let tools = json!([{"type":"function", "function":{
         "name":"read_file", "description":"Read a file",
         "parameters":{"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]}
     }}]);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let completion = stream_completion(
+    let mut completion = stream_completion(
         &reqwest::Client::new(),
         &api.cfg,
-        &messages,
+        &messages.each_ref(),
         Some(&tools),
         &tx,
     )
@@ -1183,7 +1215,7 @@ async fn responses_mode_streams_text_tools_usage_and_reuses_output_items() {
     assert_eq!(usage.completion_tokens, 8);
     assert_eq!(usage.cached_tokens, Some(12));
 
-    let assistant_message = completion.assistant_message();
+    let assistant_message = completion.take_assistant_message();
     assert_eq!(
         assistant_message["responses_output_items"]
             .as_array()
@@ -1191,11 +1223,9 @@ async fn responses_mode_streams_text_tools_usage_and_reuses_output_items() {
             .len(),
         2
     );
-    assert_eq!(responses_input(&[assistant_message])[0]["type"], "message");
-    assert_eq!(
-        responses_input(&[completion.assistant_message()])[1]["call_id"],
-        "call_read"
-    );
+    let replay = responses_input(std::iter::once(&assistant_message));
+    assert_eq!(replay[0]["type"], "message");
+    assert_eq!(replay[1]["call_id"], "call_read");
     let mut text_events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         if let AgentEvent::Text(text) = event {

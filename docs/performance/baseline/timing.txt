@@ -1,0 +1,44 @@
+
+running 1 test
+test agent::performance::timing ... plain                   time:   [1.6385 ms 1.8266 ms 2.1223 ms]
+                        change: [+57.285% +73.923% +93.633%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+
+history_30              time:   [17.109 ms 17.895 ms 18.845 ms]
+                        change: [+12.512% +18.287% +24.285%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+tools_3                 time:   [7.1021 ms 7.1660 ms 7.2406 ms]
+                        change: [−23.944% −16.620% −8.8713%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+
+stream_2048             time:   [141.38 ms 142.89 ms 144.81 ms]
+                        change: [−11.173% −8.4982% −5.8549%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+
+large_json              time:   [6.5796 ms 7.3253 ms 8.1679 ms]
+                        change: [−11.108% −2.8282% +7.2545%] (p = 0.56 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+requests_100            time:   [106.59 ms 109.33 ms 113.34 ms]
+                        change: [−8.5824% −1.8668% +4.2162%] (p = 0.62 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out; finished in 38.66s
+

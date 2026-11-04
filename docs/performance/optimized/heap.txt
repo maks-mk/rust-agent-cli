@@ -1,0 +1,12 @@
+
+running 1 test
+test agent::performance::profile ... PROFILE plain total_bytes=152215 peak_bytes=117756 retained_bytes=40
+PROFILE history_30 total_bytes=10004515 peak_bytes=5790344 retained_bytes=40
+PROFILE tools_3 total_bytes=1597321 peak_bytes=433432 retained_bytes=40
+PROFILE stream_2048 total_bytes=4426649 peak_bytes=122422 retained_bytes=40
+PROFILE large_json total_bytes=3106439 peak_bytes=1609948 retained_bytes=40
+PROFILE requests_100 total_bytes=13362676 peak_bytes=117756 retained_bytes=40
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 152 filtered out; finished in 1.20s
+

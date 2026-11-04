@@ -1,0 +1,24 @@
+Benchmarking plain
+Benchmarking plain: Warming up for 1.0000 s
+Benchmarking plain: Collecting 20 samples in estimated 3.0041 s (1680 iterations)
+Benchmarking plain: Analyzing
+Benchmarking history_30
+Benchmarking history_30: Warming up for 1.0000 s
+Benchmarking history_30: Collecting 20 samples in estimated 4.7927 s (420 iterations)
+Benchmarking history_30: Analyzing
+Benchmarking tools_3
+Benchmarking tools_3: Warming up for 1.0000 s
+Benchmarking tools_3: Collecting 20 samples in estimated 4.4293 s (630 iterations)
+Benchmarking tools_3: Analyzing
+Benchmarking stream_2048
+Benchmarking stream_2048: Warming up for 1.0000 s
+Benchmarking stream_2048: Collecting 20 samples in estimated 5.9012 s (40 iterations)
+Benchmarking stream_2048: Analyzing
+Benchmarking large_json
+Benchmarking large_json: Warming up for 1.0000 s
+Benchmarking large_json: Collecting 20 samples in estimated 3.4690 s (630 iterations)
+Benchmarking large_json: Analyzing
+Benchmarking requests_100
+Benchmarking requests_100: Warming up for 1.0000 s
+Benchmarking requests_100: Collecting 20 samples in estimated 4.1915 s (40 iterations)
+Benchmarking requests_100: Analyzing
