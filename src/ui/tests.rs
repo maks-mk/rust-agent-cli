@@ -72,6 +72,46 @@ fn session_menu_hides_the_verbatim_workspace_prefix() {
     );
 }
 
+#[test]
+fn model_menu_shows_current_model_loading_and_manual_entry() {
+    let mut app = app();
+    app.input.set("/model");
+    app.on_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    let rows = render(&mut app, 100, 24).join("\n");
+    assert!(rows.contains("Current: test-model"), "{rows}");
+    assert!(rows.contains("Loading models..."), "{rows}");
+    assert!(rows.contains("Enter model name manually..."), "{rows}");
+}
+
+#[test]
+fn model_menu_scrolls_to_selection_and_fits_short_terminals() {
+    let mut app = app();
+    app.input.set("/model");
+    app.on_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    let menu = app.model_menu.as_mut().unwrap();
+    menu.items = (0..50).map(|index| format!("model-{index:02}")).collect();
+    menu.message = None;
+    menu.selected = 49;
+    let rows = render(&mut app, 80, 24).join("\n");
+    assert!(rows.contains("model-49"), "{rows}");
+    app.model_menu.as_mut().unwrap().selected = 50;
+    let rows = render(&mut app, 80, 12).join("\n");
+    assert!(rows.contains("Enter model name manually..."), "{rows}");
+    for (width, height) in [(1, 1), (20, 5), (30, 8)] {
+        render(&mut app, width, height);
+    }
+}
+
 fn usage(prompt: u64, completion: u64, cached: Option<u64>) -> TokenUsage {
     TokenUsage {
         prompt_tokens: prompt,
@@ -1079,7 +1119,8 @@ fn the_command_menu_lists_the_available_commands() {
         );
     }
     assert!(
-        rows.iter().any(|r| r.contains("show or change the model")),
+        rows.iter()
+            .any(|r| r.contains("show available models or enter a model name")),
         "expected the description next to the command: {rows:?}"
     );
 }

@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod models;
+pub use models::ModelMenu;
+
 // ─────────────────────────────── chat entries ───────────────────────────────
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -185,7 +188,7 @@ pub struct CommandSpec {
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/model",
-        desc: "show or change the model",
+        desc: "show available models or enter a model name",
         arg: Some("[name]"),
         aliases: &[],
     },
@@ -431,6 +434,7 @@ pub struct App {
     pending_queue: VecDeque<Pending>,
     pub slash: Option<SlashMenu>,
     pub session_menu: Option<SessionMenu>,
+    pub model_menu: Option<ModelMenu>,
     pub auto: Arc<AtomicBool>,
 
     pub rendered: crate::ui::HistoryState,
@@ -520,6 +524,7 @@ impl App {
             pending_queue: VecDeque::new(),
             slash: None,
             session_menu: None,
+            model_menu: None,
             auto: Arc::new(AtomicBool::new(auto_approve)),
             rendered: crate::ui::HistoryState::default(),
             clear_terminal: false,
@@ -540,6 +545,9 @@ impl App {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
             Event::Paste(s) => {
                 if self.pending.is_none() {
+                    if self.model_menu_visible() {
+                        self.model_manual_entry();
+                    }
                     let s = s.replace("\r\n", "\n").replace('\r', "\n");
                     self.input.insert_str(&s);
                     self.sync_slash();
@@ -632,6 +640,28 @@ impl App {
                     }
                 }
                 self.pending = self.pending_queue.pop_front();
+            }
+            return;
+        }
+
+        if self.model_menu_visible() {
+            match k.code {
+                KeyCode::Up => self.model_move(-1),
+                KeyCode::Down => self.model_move(1),
+                KeyCode::Home => self.model_menu.as_mut().unwrap().selected = 0,
+                KeyCode::End => {
+                    let menu = self.model_menu.as_mut().unwrap();
+                    menu.selected = menu.items.len();
+                }
+                KeyCode::Enter => self.model_accept(),
+                KeyCode::Esc => self.model_menu = None,
+                KeyCode::Char('c') if ctrl && !alt => self.model_menu = None,
+                KeyCode::Char('d') if ctrl => self.should_quit = true,
+                KeyCode::Char(c) if !ctrl || alt => {
+                    self.model_manual_entry();
+                    self.input.insert_char(c);
+                }
+                _ => {}
             }
             return;
         }
@@ -831,7 +861,7 @@ impl App {
     /// Whether the command menu is currently shown.
     pub fn slash_menu_visible(&self) -> bool {
         // Session selection and approval prompts take precedence over command completion.
-        if self.pending.is_some() || self.session_menu.is_some() {
+        if self.pending.is_some() || self.session_menu.is_some() || self.model_menu.is_some() {
             return false;
         }
         self.slash
@@ -841,6 +871,7 @@ impl App {
 
     pub fn session_menu_visible(&self) -> bool {
         self.pending.is_none()
+            && self.model_menu.is_none()
             && self
                 .session_menu
                 .as_ref()
@@ -990,6 +1021,7 @@ impl App {
         self.entries.push(Entry::Banner);
 
         self.session_menu = None;
+        self.model_menu = None;
         self.slash = None;
         self.persistence_error = None;
     }
@@ -1296,13 +1328,9 @@ impl App {
             }
             "/model" => {
                 if arg.is_empty() {
-                    self.entries
-                        .push(Entry::Notice(format!("Current model: {}", self.cfg.model)));
+                    self.open_model_menu();
                 } else {
-                    self.cfg.model = arg.to_string();
-                    self.entries
-                        .push(Entry::Notice(format!("Model set to {arg}")));
-                    self.autosave();
+                    self.set_model(arg);
                 }
             }
             "/auto" => {
@@ -1324,7 +1352,7 @@ impl App {
                 let arrows = if ascii_mode() { "Up/Down" } else { "↑/↓" };
                 self.entries.push(Entry::Notice(format!(
                     "Commands\n\
-                     /model [name]  show or change the model\n\
+                     /model [name]  choose from available models or enter a name manually\n\
                      /auto          toggle auto-approve for writes and shell commands\n\
                      /clear         start a new session in this workspace\n\
                      /session       list or switch saved sessions\n\
@@ -1377,6 +1405,7 @@ impl App {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.model_menu = None;
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;

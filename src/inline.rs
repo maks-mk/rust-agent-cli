@@ -128,6 +128,9 @@ async fn run(
                 while let Ok(msg) = rx.try_recv() { app.on_agent(msg); }
                 dirty = true;
             },
+            _ = app.poll_models(), if app.models_loading() => {
+                dirty = true;
+            },
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_spin)), if working => {
                 app.tick = app.tick.wrapping_add(1);
                 next_spin = Instant::now() + Duration::from_millis(80);

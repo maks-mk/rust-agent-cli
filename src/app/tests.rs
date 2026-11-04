@@ -1152,6 +1152,187 @@ fn press(app: &mut App, code: KeyCode) {
     app.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
 }
 
+async fn model_server(status: u16, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let body = body.to_owned();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut buf = [0; 1024];
+            let count = socket.read(&mut buf).await.unwrap();
+            assert_ne!(count, 0);
+            request.extend_from_slice(&buf[..count]);
+        }
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    (base_url, task)
+}
+
+#[tokio::test]
+async fn model_menu_loads_selects_and_preserves_conversation() {
+    let (base_url, task) = model_server(
+        200,
+        r#"{"data":[{"id":"test-model"},{"id":"other-model"}]}"#,
+    )
+    .await;
+    let (mut app, _rx) = app();
+    app.client = reqwest::Client::builder().no_proxy().build().unwrap();
+    app.cfg.base_url = base_url.clone();
+    app.cfg.api_mode = crate::agent::ApiMode::Responses;
+    app.history
+        .push(json!({"role":"user", "content":"keep me"}));
+    let history = app.history.clone();
+    let session = app.session.id.clone();
+    type_text(&mut app, "/model");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.model_menu_visible());
+    assert!(app.models_loading());
+    assert!(!app.running);
+    assert!(!app.slash_menu_visible());
+    tokio::time::timeout(Duration::from_secs(3), app.poll_models())
+        .await
+        .unwrap();
+    task.await.unwrap();
+    let menu = app.model_menu.as_ref().unwrap();
+    assert_eq!(menu.items, ["other-model", "test-model"]);
+    assert_eq!(menu.selected, 1);
+    assert!(!app.models_loading());
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cfg.model, "other-model");
+    assert!(!app.model_menu_visible());
+    assert!(app.input.is_empty());
+    assert_eq!(app.history, history);
+    assert_eq!(app.session.id, session);
+    assert_eq!(app.cfg.base_url, base_url);
+    assert_eq!(app.cfg.api_key, "test");
+}
+
+#[tokio::test]
+async fn empty_or_failed_model_discovery_keeps_manual_entry_available() {
+    for (status, body, message) in [
+        (200, r#"{"data":[]}"#, "No models returned"),
+        (404, "not found", "HTTP 404"),
+        (200, "invalid json", "Invalid model list response"),
+    ] {
+        let (base_url, task) = model_server(status, body).await;
+        let (mut app, _rx) = app();
+        app.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        app.cfg.base_url = base_url;
+        app.command("/model");
+        tokio::time::timeout(Duration::from_secs(3), app.poll_models())
+            .await
+            .unwrap();
+        task.await.unwrap();
+        let menu = app.model_menu.as_ref().unwrap();
+        assert!(menu.items.is_empty());
+        assert!(menu.message.as_ref().unwrap().contains(message));
+        assert_eq!(app.cfg.model, "test-model");
+        assert!(!app.running);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "fallback-model");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.cfg.model, "fallback-model");
+    }
+}
+
+#[tokio::test]
+async fn model_discovery_survives_select_interruption_and_can_be_cancelled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (mut app, _rx) = app();
+    app.client = reqwest::Client::builder().no_proxy().build().unwrap();
+    app.cfg.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    app.command("/model");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            _ = app.poll_models() => panic!("server has not replied"),
+            connection = listener.accept() => {
+                let (_socket, _) = connection.unwrap();
+                assert!(app.models_loading());
+                press(&mut app, KeyCode::Esc);
+                assert!(!app.models_loading());
+            }
+        }
+    })
+    .await
+    .unwrap();
+    app.command("/model after-cancel");
+    assert_eq!(app.cfg.model, "after-cancel");
+    assert!(app.model_menu.is_none());
+}
+
+#[test]
+fn model_menu_manual_entry_and_escape_work_while_loading() {
+    let (mut app, _rx) = app();
+    app.command("/model");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.model_menu.is_none());
+    assert!(!app.models_loading());
+    assert_eq!(app.cfg.model, "test-model");
+    app.command("/model");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.input.text(), "/model ");
+    assert!(!app.models_loading());
+    type_text(&mut app, "custom/not-listed");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cfg.model, "custom/not-listed");
+    assert!(!app.running);
+}
+
+#[test]
+fn typing_and_pasting_in_model_menu_switch_to_manual_entry() {
+    let (mut app, _rx) = app();
+    app.command("/model");
+    type_text(&mut app, "typed-model");
+    assert_eq!(app.input.text(), "/model typed-model");
+    assert!(app.model_menu.is_none());
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cfg.model, "typed-model");
+    app.command("/model");
+    app.on_event(Event::Paste("pasted-model".into()));
+    assert_eq!(app.input.text(), "/model pasted-model");
+    assert!(app.model_menu.is_none());
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.cfg.model, "pasted-model");
+}
+
+#[test]
+fn model_navigation_includes_manual_entry_and_wraps() {
+    let (mut app, _rx) = app();
+    app.command("/model");
+    app.model_menu.as_mut().unwrap().items = vec!["one".into(), "two".into()];
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.model_menu.as_ref().unwrap().selected, 2);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.model_menu.as_ref().unwrap().selected, 0);
+    press(&mut app, KeyCode::End);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.input.text(), "/model ");
+    assert_eq!(app.cfg.model, "test-model");
+}
+
+#[test]
+fn explicit_model_command_cancels_discovery_without_validation() {
+    let (mut app, _rx) = app();
+    app.command("/model");
+    app.command("/model arbitrary-model");
+    assert_eq!(app.cfg.model, "arbitrary-model");
+    assert!(!app.models_loading());
+    assert!(app.model_menu.is_none());
+}
+
 /// Presses the shortcut that switches the reasoning level.
 fn tab_key(app: &mut App) {
     app.on_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));

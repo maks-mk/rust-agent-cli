@@ -153,9 +153,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let status_h = u16::from(area.height > min_input + footer_h + usage_h);
     let input_h = input_h.min(area.height.saturating_sub(footer_h + usage_h + status_h));
 
-    // Command completion and the session selector share a menu band.
+    // Command completion and the selectors share a menu band.
     let session_menu = app.session_menu_visible();
-    let menu_items = if session_menu {
+    let model_menu = app.model_menu_visible();
+    let menu_items = if model_menu {
+        app.model_menu
+            .as_ref()
+            .map(|m| m.items.len() + 1 + usize::from(m.message.is_some()))
+            .unwrap_or(0)
+    } else if session_menu {
         app.session_menu
             .as_ref()
             .map(|m| m.items.len())
@@ -171,9 +177,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let free = area
         .height
         .saturating_sub(status_h + input_h + usage_h + footer_h + 1);
-    let menu_h = if (session_menu || app.slash_menu_visible()) && app.pending.is_none() && free >= 3
+    let menu_h = if (model_menu || session_menu || app.slash_menu_visible())
+        && app.pending.is_none()
+        && free >= 3
     {
-        (menu_content_lines as u16 + 2).min(free).min(12)
+        (menu_content_lines.saturating_add(2).min(12) as u16).min(free)
     } else {
         0
     };
@@ -217,7 +225,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     draw_chat(f, app, chat);
     if let Some(rect) = menu_chunk {
-        if session_menu {
+        if model_menu {
+            draw_model_menu(f, app, rect);
+        } else if session_menu {
             draw_session_menu(f, app, rect);
         } else {
             draw_slash_menu(f, app, rect);
@@ -317,6 +327,54 @@ fn draw_session_menu(f: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(menu.selected));
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_model_menu(f: &mut Frame, app: &App, area: Rect) {
+    let Some(menu) = &app.model_menu else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Line::styled(
+            format!(" Models | Current: {} ", app.cfg.model),
+            fg(MENU_TITLE).add_modifier(Modifier::BOLD),
+        ))
+        .style(fg(USER_TEXT).bg(SURFACE))
+        .border_style(fg(MENU_BORDER));
+    let mut inner = block.inner(area);
+    f.render_widget(block, area);
+    if let Some(message) = &menu.message {
+        // Always leave room for the manual-entry option in short terminals.
+        if inner.height > 1 {
+            let status = Rect { height: 1, ..inner };
+            f.render_widget(Paragraph::new(message.as_str()).style(muted()), status);
+            inner.y += 1;
+            inner.height -= 1;
+        }
+    }
+    let mut items: Vec<ListItem> = menu
+        .items
+        .iter()
+        .map(|model| {
+            let active = model == &app.cfg.model;
+            ListItem::new(Line::from(vec![
+                Span::styled(if active { "* " } else { "  " }, fg(MENU_ACTIVE)),
+                Span::styled(
+                    model.as_str(),
+                    if active { fg(MENU_TITLE) } else { fg(TEXT) },
+                ),
+            ]))
+        })
+        .collect();
+    items.push(ListItem::new(Line::styled(
+        "Enter model name manually...",
+        fg(MENU_COMMAND),
+    )));
+    let list = List::new(items)
+        .highlight_style(fg(USER_TEXT).bg(MENU_SELECTION))
+        .highlight_symbol(glyphs().user);
+    let mut state = ListState::default();
+    state.select(Some(menu.selected));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn pad_h(r: Rect) -> Rect {
@@ -1804,7 +1862,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     ));
     let right = Line::from(right);
     let (left_area, right_area) = bar_areas(area, right.width());
-    let left = if app.session_menu_visible() {
+    let left = if app.model_menu_visible() {
+        let arrows = if ascii_mode() { "Up/Down" } else { "↑/↓" };
+        if left_area.width >= 52 {
+            format!("{arrows} select | Enter choose | type name | Esc close")
+        } else {
+            "Enter choose | Esc close".to_string()
+        }
+    } else if app.session_menu_visible() {
         let up = if ascii_mode() { "Up" } else { "↑" };
         let down = if ascii_mode() { "Down" } else { "↓" };
         if left_area.width >= 30 {
