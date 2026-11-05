@@ -1574,3 +1574,93 @@ fn usage_parsing_rejects_unknown_values_and_keeps_api_total() {
         0
     );
 }
+
+#[test]
+fn usage_audit_documented_payloads_count_reasoning_and_cache_once() {
+    for (value, input, output, total, cache) in [
+        (
+            json!({"prompt_tokens":172,"completion_tokens":312,"total_tokens":484,
+            "total_characters":0,"prompt_tokens_details":{"cached_tokens":159}}),
+            172,
+            312,
+            484,
+            159,
+        ),
+        (
+            json!({"input_tokens":218,"output_tokens":68,"total_tokens":286,
+            "input_tokens_details":{"cached_tokens":189},
+            "output_tokens_details":{"reasoning_tokens":36}}),
+            218,
+            68,
+            286,
+            189,
+        ),
+        (
+            json!({"input_tokens":75,"output_tokens":1186,"total_tokens":1261,
+            "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":50},
+            "output_tokens_details":{"reasoning_tokens":1024}}),
+            75,
+            1186,
+            1261,
+            0,
+        ),
+    ] {
+        assert_eq!(
+            TokenUsage::from_value(&value),
+            Some(TokenUsage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: total,
+                cached_tokens: Some(cache),
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_audit_responses_completed_publishes_usage_before_connection_closes() {
+    let api = MockApi::start(vec![]).await;
+    let mut cfg = api.cfg.clone();
+    cfg.api_mode = ApiMode::Responses;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (release, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut buf = [0; 4096];
+            let count = socket.read(&mut buf).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buf[..count]);
+        }
+        let completed = json!({"type":"response.completed","response":{
+            "status":"completed", "output":[], "usage":{
+                "input_tokens":218,"output_tokens":68,"total_tokens":286,
+                "input_tokens_details":{"cached_tokens":189}}}});
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\ndata: {completed}\n\n").as_bytes()).await.unwrap();
+        let _ = released.await;
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = timeout(
+        Duration::from_secs(1),
+        stream_completion(&reqwest::Client::new(), &cfg, &[], None, &tx),
+    )
+    .await;
+    let _ = release.send(());
+    server.await.unwrap();
+    let completion = result
+        .expect("terminal Responses event must finish without waiting for EOF")
+        .unwrap();
+    assert_eq!(completion.usage.unwrap().total_tokens, 286);
+    let reports: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| {
+            if let AgentEvent::Usage { usage, complete } = event {
+                Some((usage.total_tokens, complete))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(reports, [(286, true)]);
+}

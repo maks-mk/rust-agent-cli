@@ -568,27 +568,6 @@ fn shell_output_for_ui_strips_ansi_without_losing_visible_text() {
 }
 
 #[test]
-fn shell_ui_summary_normalizes_before_selecting_lines() {
-    for (stdout, stderr) in [
-        ("", ""),
-        (" \r\n\t", "\r"),
-        ("\x1b[32m\x1b[0m", "\x1b]0;title\x07"),
-    ] {
-        assert_eq!(shell_ui_summary(stdout, stderr), "(no output)");
-    }
-    assert_eq!(
-        shell_ui_summary("\x1b[32mPath\x1b[0m\rnext", "\x1b[31merror\x1b[0m"),
-        "next\nerror"
-    );
-    let stdout = format!("\x1b[31merror:\x1b[0m hidden\n{}", "ok\n".repeat(6));
-    let summary = shell_ui_summary(&stdout, "");
-    assert!(
-        summary.contains("[errors: 1 of 1]\nerror: hidden"),
-        "{summary}"
-    );
-}
-
-#[test]
 fn powershell_args_use_encoded_command() {
     let args = powershell_args("Write-Output \"hi\"");
     assert_eq!(args[0], "-NoProfile");
@@ -653,15 +632,9 @@ fn shell_preview_cuts_long_lines_and_marks_the_cut() {
 
 #[test]
 fn shell_preview_marks_omitted_lines_and_cuts_on_character_boundaries() {
-    let command = (1..=SHELL_DIFF_LINES + 2)
-        .map(|n| format!("line-{n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let preview = shell_preview(&command);
-    assert_eq!(preview.len(), SHELL_DIFF_LINES + 1);
-    let last = &preview[preview.len() - 1];
-    assert!(last.text.starts_with(SHELL_UI_CUT_MARKER));
-    assert!(last.text.contains("preview truncated"));
+    let preview = shell_preview("echo first\n\tsecond\r\nlast");
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview[0].text, "$ echo first  second last");
 
     // A multi-byte character is never split in half by the cut.
     let command = "é".repeat(MAX_SHELL_UI_ARG_CHARS + 10);

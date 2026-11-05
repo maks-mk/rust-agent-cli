@@ -1,6 +1,6 @@
 //! Fullscreen rendering with cached history and a pinned input area.
 
-use crate::agent::{classify_shell_line, Config, DiffKind, ShellLineKind, ToolStatus};
+use crate::agent::{Config, DiffKind, ToolStatus};
 use crate::app::{App, ChatUsage, Entry, COMMANDS};
 use crate::session::format_timestamp;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -625,20 +625,22 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
                 ToolStatus::Ok => (if ascii_mode() { "+" } else { "√" }, "done", OK),
                 ToolStatus::Failed => ("x", "failed", ERR),
                 ToolStatus::Denied => ("!", "denied", WARN),
+                ToolStatus::Cancelled => ("!", "cancelled", WARN),
             };
+            if t.label == "Shell" {
+                return shell_card(t, width, icon, state, color);
+            }
             let tool_color = match t.label.as_str() {
                 "Read" => READ,
                 "Write" | "Edit" | "Shell" => WARN,
                 _ => ACCENT,
             };
-            let shell_preview = t.label == "Shell" && !t.diff.is_empty();
             let mut header = vec![
                 Span::styled(format!("{icon} "), fg(color)),
                 Span::styled(t.label.clone(), fg(tool_color).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" [{state}]"), fg(color)),
             ];
-            // Shell already has a command preview below; do not echo it twice.
-            if !shell_preview && !t.target.is_empty() {
+            if !t.target.is_empty() {
                 header.push(Span::styled(format!("  {}", t.target), muted()));
             }
             v.push((Line::from(header), 2));
@@ -655,7 +657,6 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
                 let (text, style) = match d.kind {
                     DiffKind::Add => (format!("+ {}", d.text), fg(OK)),
                     DiffKind::Del => (format!("- {}", d.text), fg(ERR)),
-                    DiffKind::Context if shell_preview => (d.text.clone(), muted()),
                     DiffKind::Context => (format!("  {}", d.text), muted()),
                     DiffKind::More => (d.text.clone(), muted().add_modifier(Modifier::ITALIC)),
                 };
@@ -670,33 +671,25 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
                 } else {
                     muted()
                 };
-                if t.label == "Shell" {
-                    v.extend(shell_output_lines(output, width, output_style));
-                } else {
-                    for (i, line) in output.split('\n').enumerate() {
-                        let prefix = if i == 0 { glyphs().result } else { "     " };
-                        v.push((
-                            Line::from(vec![
-                                Span::styled(prefix, output_style),
-                                Span::styled(line.to_string(), output_style),
-                            ]),
-                            7,
-                        ));
-                    }
+                for (i, line) in output.split('\n').enumerate() {
+                    let prefix = if i == 0 { glyphs().result } else { "     " };
+                    v.push((
+                        Line::from(vec![
+                            Span::styled(prefix, output_style),
+                            Span::styled(line.to_string(), output_style),
+                        ]),
+                        7,
+                    ));
                 }
             }
             if let Some(r) = &t.result {
-                if t.label == "Shell" && t.output.is_none() {
-                    v.extend(shell_output_lines(r, width, fg(color)));
-                } else {
-                    v.push((
-                        Line::from(vec![
-                            Span::styled(glyphs().result, fg(color)),
-                            Span::styled(r.clone(), fg(color)),
-                        ]),
-                        5,
-                    ));
-                }
+                v.push((
+                    Line::from(vec![
+                        Span::styled(glyphs().result, fg(color)),
+                        Span::styled(r.clone(), fg(color)),
+                    ]),
+                    5,
+                ));
             }
         }
 
@@ -734,142 +727,90 @@ fn render_entry(app: &App, e: &Entry, is_last: bool, spin: &str, width: usize) -
     v
 }
 
-const MAX_SHELL_PREVIEW_ROWS: usize = 8;
-const MAX_SHELL_PREVIEW_LINE_ROWS: usize = 2;
-const MAX_SHELL_PREVIEW_CHARS: usize = 1000;
-
-/// Bound a logical line before wrapping, then retain its head and a full-width tail.
-fn shell_preview_line(text: &str, width: usize, char_limit: usize) -> (Vec<String>, bool) {
-    let ellipsis = glyphs().ellipsis;
-    let text = text.replace('\t', "    ");
-    let chars: Vec<char> = text.chars().collect();
-    let mut shortened = chars.len() > char_limit;
-    let text = if shortened {
-        let head = char_limit.saturating_sub(1).div_ceil(2);
-        let tail = char_limit.saturating_sub(1) / 2;
-        chars[..head]
-            .iter()
-            .chain(std::iter::once(&ellipsis))
-            .chain(chars[chars.len() - tail..].iter())
-            .collect::<String>()
-    } else {
-        text
-    };
-    let mut rows: Vec<String> = wrap_line(&Line::from(text.clone()), width, 0)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect()
-        })
-        .collect();
-    if rows.len() > MAX_SHELL_PREVIEW_LINE_ROWS {
-        shortened = true;
-        let last = fit_left(&text, width, ellipsis);
-        rows.truncate(1);
-        rows[0] = fit(&format!("{}{ellipsis}", rows[0]), width, ellipsis);
-        rows.push(last);
-    }
-    (rows, shortened)
+/// Shell rows are fitted before the history wrapper sees them.
+fn shell_row(text: &str, width: usize, style: Style) -> RLine {
+    (Line::styled(fit(text, width, glyphs().ellipsis), style), 0)
 }
 
-/// UI-only limits also apply to restored history and background shell results.
-/// Keep the exit code separate; choose diagnostics before the tail, but display
-/// selected lines in their original order. The stored/model output is untouched.
-fn shell_output_lines(output: &str, width: usize, style: Style) -> Vec<RLine> {
+fn shell_one_line(text: &str) -> String {
+    crate::process_output::terminal_safe_text(text)
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect()
+}
+
+fn shell_card(
+    t: &crate::app::ToolEntry,
+    width: usize,
+    icon: &str,
+    state: &str,
+    color: Color,
+) -> Vec<RLine> {
     if width == 0 {
         return Vec::new();
     }
-    let g = glyphs();
-    let gutter = " ".repeat(5.min(width.saturating_sub(1)));
-    let content_width = width - gutter.len();
-    let row_chars = |row: &str| gutter.len() + row.chars().count() + 1;
-    let marker = fit(
-        &format!("{} output truncated", g.ellipsis),
-        content_width,
-        g.ellipsis,
-    );
-    let mut out = Vec::new();
-    let mut lines = output.lines().peekable();
-    if lines.peek().is_some_and(|line| {
-        line.strip_prefix("exit code: ")
-            .is_some_and(|code| code.parse::<i32>().is_ok())
-    }) {
-        // Do not let the status consume the body budget on very narrow screens.
-        out.push(fit_left(lines.next().unwrap(), content_width, g.ellipsis));
+    let heading = format!("{icon} Shell [{state}]");
+    let mut header = if heading.chars().map(cw).sum::<usize>() <= width {
+        vec![
+            Span::styled(format!("{icon} "), fg(color)),
+            Span::styled("Shell", fg(WARN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" [{state}]"), fg(color)),
+        ]
+    } else {
+        vec![Span::styled(
+            fit(&heading, width, glyphs().ellipsis),
+            fg(color),
+        )]
+    };
+    let used = header.iter().map(Span::width).sum::<usize>();
+    if let Some(result) = &t.result {
+        let result = shell_one_line(result);
+        header.push(Span::styled(
+            fit(
+                &format!(" · {result}"),
+                width.saturating_sub(used),
+                glyphs().ellipsis,
+            ),
+            fg(color),
+        ));
     }
-    let status_chars: usize = out.iter().map(|row| row_chars(row)).sum();
-    let body_chars = MAX_SHELL_PREVIEW_CHARS.saturating_sub(status_chars);
-    let available_chars = body_chars.saturating_sub(row_chars(&marker));
-    let line_chars = available_chars
-        .saturating_sub(MAX_SHELL_PREVIEW_LINE_ROWS * (gutter.len() + 1))
-        .max(1);
-    let mut shortened = false;
-    let mut candidates = Vec::new();
-    for (index, line) in lines.enumerate() {
-        // These counts describe the agent's logical-line summary, not the final
-        // screen preview. Replace them with one honest truncation indicator.
-        if line.ends_with(']')
-            && [
-                "[stdout: last ",
-                "[stderr: last ",
-                "[errors: ",
-                "[warnings: ",
-            ]
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-        {
-            shortened = true;
-            continue;
+    let mut rows = vec![(Line::from(header), 0)];
+    let command = if t.target.is_empty() {
+        t.diff
+            .first()
+            .map(|d| d.text.strip_prefix("$ ").unwrap_or(&d.text))
+            .unwrap_or("")
+    } else {
+        &t.target
+    };
+    rows.push(shell_row(
+        &format!("  $ {}", shell_one_line(command)),
+        width,
+        muted(),
+    ));
+    if matches!(t.status, ToolStatus::Running | ToolStatus::Waiting) {
+        if let Some(output) = &t.output {
+            rows.extend(shell_output_lines(output, width, muted()));
         }
-        let priority = match classify_shell_line(line) {
-            Some(ShellLineKind::Error) => 0,
-            Some(ShellLineKind::Warning) => 1,
-            None => 2,
-        };
-        let (rows, cut) = shell_preview_line(line, content_width, line_chars);
-        shortened |= cut;
-        candidates.push((index, priority, rows));
     }
-    let total_rows: usize = candidates.iter().map(|(_, _, rows)| rows.len()).sum();
-    let total_chars: usize = candidates
-        .iter()
-        .flat_map(|(_, _, rows)| rows)
-        .map(|row| row_chars(row))
-        .sum();
-    shortened |= total_rows > MAX_SHELL_PREVIEW_ROWS || total_chars > body_chars;
-    if shortened {
-        candidates.sort_by_key(|(index, priority, _)| (*priority, std::cmp::Reverse(*index)));
-        let mut rows_left = MAX_SHELL_PREVIEW_ROWS - 1;
-        let mut chars_left = available_chars;
-        candidates.retain(|(_, _, rows)| {
-            let chars: usize = rows.iter().map(|row| row_chars(row)).sum();
-            if rows.len() > rows_left || chars > chars_left {
-                return false;
-            }
-            rows_left -= rows.len();
-            chars_left -= chars;
-            true
-        });
-        candidates.sort_by_key(|(index, _, _)| *index);
+    rows
+}
+
+/// Each logical output line occupies exactly one physical row, including after resize.
+fn shell_output_lines(output: &str, width: usize, style: Style) -> Vec<RLine> {
+    if output.is_empty() || width == 0 {
+        return Vec::new();
     }
-    out.extend(candidates.into_iter().flat_map(|(_, _, rows)| rows));
-    if shortened {
-        out.push(marker);
-    }
-    out.into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let prefix = if index == 0 {
-                fit(g.result, gutter.len(), g.ellipsis)
-            } else {
-                gutter.clone()
-            };
-            // Already wrapped at the current width: entry_lines must not add
-            // more rows or hanging indentation to this bounded preview.
-            (Line::styled(format!("{prefix}{row}"), style), 0)
-        })
+    let prefix = " ".repeat(5.min(width.saturating_sub(1)));
+    let lines: Vec<_> = output
+        .split('\n')
+        .rev()
+        .take(crate::agent::shell_stream::PREVIEW_LINES)
+        .collect();
+    lines
+        .into_iter()
+        .rev()
+        .map(|line| shell_row(&format!("{prefix}{}", shell_one_line(line)), width, style))
         .collect()
 }
 

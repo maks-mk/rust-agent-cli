@@ -860,7 +860,7 @@ async fn shell_drains_both_streams_with_bounded_capture() {
     let run = shell_output(command, &api.cfg.root, Duration::from_secs(15))
         .await
         .unwrap();
-    assert_eq!(run.code, 7);
+    assert_eq!(run.code, Some(7));
     // Every stream keeps a head and a tail inside the byte budget.
     assert_eq!(run.stdout.head.len(), SHELL_STREAM_HEAD_BYTES);
     assert_eq!(run.stdout.tail.len(), SHELL_STREAM_TAIL_BYTES);
@@ -951,73 +951,14 @@ async fn shell_tool_formats_empty_and_ansi_output_with_exit_code() {
         };
         let mut outputs = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let AgentEvent::ToolOutput { output, .. } = event {
-                outputs.push(output);
+            if let AgentEvent::ShellStream { updates, .. } = event {
+                outputs.push(updates.borrow().clone());
             }
         }
-        assert_eq!(outputs, [format!("exit code: {code}\n{expected}")]);
+        assert_eq!(outputs, [label.to_string()]);
         assert!(content.ends_with(&format!("exit code: {code}\n{expected}")));
         assert!(!content.contains('\x1b'));
     }
-}
-
-#[test]
-fn shell_ui_summary_shows_the_end_of_the_output() {
-    let stdout = (1..=25)
-        .map(|n| format!("line-{n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary = shell_ui_summary(&stdout, "");
-    let lines: Vec<&str> = summary.lines().collect();
-    // The header marks the omitted head, the tail keeps the last lines.
-    assert_eq!(lines.len(), MAX_SHELL_UI_TAIL_LINES + 1);
-    assert!(lines[0].contains(&format!("last {MAX_SHELL_UI_TAIL_LINES} of 25 lines")));
-    assert_eq!(lines[1], format!("line-{}", 26 - MAX_SHELL_UI_TAIL_LINES));
-    assert_eq!(lines[MAX_SHELL_UI_TAIL_LINES], "line-25");
-    assert!(!summary.contains(&format!("line-{}", 25 - MAX_SHELL_UI_TAIL_LINES)));
-    // A short output is shown as it is.
-    let short = "first\nsecond";
-    assert_eq!(shell_ui_summary(short, ""), short);
-}
-
-#[test]
-fn shell_ui_summary_pulls_errors_and_warnings_out_of_the_omitted_part() {
-    let mut lines: Vec<String> = (1..=20).map(|n| format!("line-{n}")).collect();
-    lines[2] = "ERROR: boom".into();
-    lines[3] = "WARN: careful".into();
-    let summary = shell_ui_summary(&lines.join("\n"), "");
-    assert!(summary.contains("[errors: 1 of 1]"));
-    assert!(summary.contains("ERROR: boom"));
-    assert!(summary.contains("[warnings: 1 of 1]"));
-    assert!(summary.contains("WARN: careful"));
-    // The tail still shows how the command ended.
-    assert!(summary.contains("line-20"));
-}
-
-#[test]
-fn shell_ui_summary_keeps_the_end_of_both_streams() {
-    let stdout: String = (1..=15).map(|n| format!("out-{n}\n")).collect();
-    let stderr: String = (1..=15).map(|n| format!("err-{n}\n")).collect();
-    let summary = shell_ui_summary(&stdout, &stderr);
-    assert!(summary.contains(&format!(
-        "[stdout: last {MAX_SHELL_UI_TAIL_LINES} of 15 lines]"
-    )));
-    assert!(summary.contains(&format!(
-        "[stderr: last {MAX_SHELL_UI_TAIL_LINES} of 15 lines]"
-    )));
-    assert!(summary.contains("out-15"));
-    assert!(summary.contains("err-15"));
-    assert!(!summary.contains("out-1\n"));
-    assert!(!summary.contains("err-1\n"));
-}
-
-#[test]
-fn shell_ui_summary_does_not_repeat_lines_that_are_already_shown() {
-    let mut lines: Vec<String> = (1..=20).map(|n| format!("line-{n}")).collect();
-    lines[19] = "ERROR: boom".into();
-    let summary = shell_ui_summary(&lines.join("\n"), "");
-    assert!(!summary.contains("[errors:"));
-    assert!(summary.contains("ERROR: boom"));
 }
 
 #[tokio::test]
@@ -1046,14 +987,13 @@ async fn shell_tool_gives_the_model_the_full_output_and_the_user_the_tail() {
     // The user sees the end of the output only.
     let mut ui = String::new();
     while let Ok(event) = rx.try_recv() {
-        if let AgentEvent::ToolOutput { output, .. } = event {
-            ui = output;
+        if let AgentEvent::ShellStream { updates, .. } = event {
+            ui = updates.borrow().clone();
         }
     }
-    assert!(ui.contains("exit code: 0"));
     assert!(ui.contains("line-25"));
     assert!(!ui.contains("line-1\n"));
-    assert!(ui.contains(&format!("last {MAX_SHELL_UI_TAIL_LINES} of 25 lines")));
+    assert_eq!(ui.lines().count(), 5);
 }
 
 #[tokio::test]
@@ -1194,11 +1134,14 @@ async fn shell_sanitizes_captured_output_for_model_and_ui() {
     assert!(!content.contains('\x1b'), "{content:?}");
     let ui = std::iter::from_fn(|| rx.try_recv().ok())
         .find_map(|event| match event {
-            AgentEvent::ToolOutput { output, .. } => Some(output),
+            AgentEvent::ShellStream { updates, .. } => Some(updates.borrow().clone()),
             _ => None,
         })
         .unwrap();
-    assert_eq!(ui, "exit code: 0\nred\nstderr-ok");
+    assert!(ui.contains("red"));
+    assert!(ui.contains("stderr-ok"));
+    assert!(!ui.contains('\x1b'));
+    assert!(!ui.contains("ANSI-SPAM"));
 }
 
 #[cfg(windows)]
@@ -1214,7 +1157,7 @@ async fn shell_children_cannot_write_directly_to_console() {
     let run = shell_output(&command, &api.cfg.root, Duration::from_secs(15))
         .await
         .unwrap();
-    assert_eq!(run.code, 0, "{}", run.stderr.text());
+    assert_eq!(run.code, Some(0), "{}", run.stderr.text());
     assert_eq!(run.stdout.text().trim(), "console-isolated");
 }
 

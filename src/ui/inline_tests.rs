@@ -70,6 +70,59 @@ fn tool_completion_invalidates_cached_status() {
 }
 
 #[test]
+fn four_shell_streams_keep_bounded_cards_and_cached_history() {
+    let mut app = app();
+    app.entries = (0..1000)
+        .map(|_| Entry::Notice("saved history".into()))
+        .collect();
+    let mut senders = Vec::new();
+    for id in 0..4 {
+        app.on_agent(AgentEvent::ToolStart {
+            id: id.to_string(),
+            label: "Shell".into(),
+            target: format!("command-{id}"),
+        });
+        let (tx, updates) = tokio::sync::watch::channel(String::new());
+        app.on_agent(AgentEvent::ShellStream {
+            id: id.to_string(),
+            updates,
+        });
+        senders.push(tx);
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let initial = app.rendered.line_count();
+    let started = std::time::Instant::now();
+    for frame in 0..100 {
+        for (id, tx) in senders.iter().enumerate() {
+            tx.send_replace(
+                (0..5)
+                    .map(|line| format!("job-{id} frame-{frame} line-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        assert!(app.poll_shell_output());
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.rendered.formatted_entries(), 4);
+        assert_eq!(app.rendered.line_count(), initial + 20);
+        assert!(app.rendered.drawn_rows() <= 40);
+    }
+    eprintln!(
+        "four shell cards: mean_frame_us={}",
+        started.elapsed().as_micros() / 100
+    );
+    app.on_agent(AgentEvent::ToolEnd {
+        id: "0".into(),
+        status: ToolStatus::Ok,
+        summary: "Done · exit 0".into(),
+    });
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert_eq!(app.rendered.line_count(), initial + 15);
+    assert_eq!(app.rendered.lines, build_chat_lines(&app, 100));
+}
+
+#[test]
 fn fullscreen_draw_is_bounded_by_visible_rows() {
     let mut app = app();
     app.entries = (0..1000)

@@ -12,7 +12,6 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
 
 mod images;
+pub(crate) mod shell_stream;
 use images::{is_image_message, read_images, text_only_message};
 mod json_size;
 use json_size::{json_len, VisibleMessage};
@@ -69,16 +69,10 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 60_000;
 const SHELL_STREAM_HEAD_BYTES: usize = MAX_SHELL_OUTPUT_BYTES / 3;
 /// Bytes kept from the end of each stream (stdout and stderr).
 const SHELL_STREAM_TAIL_BYTES: usize = MAX_SHELL_OUTPUT_BYTES / 6;
-/// Lines of each stream shown to the user: the end of the command output.
-const MAX_SHELL_UI_TAIL_LINES: usize = 5;
-/// Error and warning lines pulled out of the part the user does not see.
-const MAX_SHELL_UI_ERROR_LINES: usize = 5;
-const MAX_SHELL_UI_WARNING_LINES: usize = 3;
 const _: () =
     assert!(2 * (SHELL_STREAM_HEAD_BYTES + SHELL_STREAM_TAIL_BYTES) <= MAX_SHELL_OUTPUT_BYTES);
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
-const SHELL_DIFF_LINES: usize = 12;
 /// Characters of a shell argument shown in the chat before it is cut.
 ///
 /// The complete command still reaches the approval dialog and the model, so
@@ -196,6 +190,7 @@ pub enum ToolStatus {
     Ok,
     Failed,
     Denied,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -254,6 +249,11 @@ pub enum AgentEvent {
     ToolOutput {
         id: String,
         output: String,
+    },
+    /// One bounded latest-value channel per foreground shell command.
+    ShellStream {
+        id: String,
+        updates: watch::Receiver<String>,
     },
     McpApproval {
         prompt: String,
@@ -545,7 +545,7 @@ pub(crate) fn tools_schema(mcp: &McpManager) -> Value {
             "function": {
                 "name": "shell",
                 "description": format!(
-                    "Run a shell command in the working directory and return its output. Independent shell calls in the same batch may run concurrently (up to four), so do not use parallel calls when they depend on each other or modify the same resources. Requires user approval unless auto-approve is enabled. On Windows the command runs via PowerShell (pwsh, falling back to powershell), elsewhere via sh -c; on Windows it is parsed as PowerShell, so backslash is literal, not an escape, and single quotes are preferred for literals and regex. The captured output keeps the beginning and the end of every stream inside a {} KB budget, and the dropped middle is marked in the text; the user only sees the end of the output and the error and warning lines, so narrow the command (for example with a filter) when the output is noisy. Set \"background\" to true to start the command detached: it keeps running after the call returns, writes its output to a log file inside the workspace, and the call returns a job id with that log path; the timeout does not apply to such a job. Use \"background_action\" (\"status\", \"stop\" or \"list\") with \"background_id\" to inspect or stop background jobs instead of running a command.",
+                    "Run a shell command in the working directory and return its output. Independent shell calls in the same batch may run concurrently (up to four), so do not use parallel calls when they depend on each other or modify the same resources. Requires user approval unless auto-approve is enabled. On Windows the command runs via PowerShell (pwsh, falling back to powershell), elsewhere via sh -c; on Windows it is parsed as PowerShell, so backslash is literal, not an escape, and single quotes are preferred for literals and regex. The captured output keeps the beginning and the end of every stream inside a {} KB budget, and the dropped middle is marked in the text; the user sees only the last five lines while the command runs, then a collapsed status, so narrow the command (for example with a filter) when the output is noisy. Set \"background\" to true to start the command detached: it keeps running after the call returns, writes its output to a log file inside the workspace, and the call returns a job id with that log path; the timeout does not apply to such a job. Use \"background_action\" (\"status\", \"stop\" or \"list\") with \"background_id\" to inspect or stop background jobs instead of running a command.",
                     MAX_SHELL_OUTPUT_BYTES / 1000
                 ),
                 "parameters": {
@@ -1274,6 +1274,9 @@ async fn stream_completion(
                             responses_output_items = Some(output);
                         }
                         finished = true;
+                        // This is the terminal Responses event. Relays can keep
+                        // the HTTP connection open after delivering final usage.
+                        break 'outer;
                     }
                     "response.failed" => {
                         return Err(provider_completion_error(
@@ -2086,17 +2089,25 @@ async fn shell(
         return start_background_job(id, command, cfg, tx).await;
     }
 
-    let run = match shell_output(command, &cfg.root, timeout).await {
+    let (updates, receiver) = watch::channel(String::new());
+    let _ = tx.send(AgentEvent::ShellStream {
+        id: id.to_string(),
+        updates: receiver,
+    });
+    let run = match shell_output_streaming(command, &cfg.root, timeout, Some(updates)).await {
         Ok(run) => run,
         Err(e) => return fail(format!("command failed: {e:#}")),
     };
 
-    let code = run.code;
+    let code = run
+        .code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable".into());
     let stdout = run.stdout.text();
     let stderr = run.stderr.text();
     // The model gets everything that was captured, including the end of the
-    // output; the user gets a condensed view built from the same text.
-    let mut text = stdout.clone();
+    // output, independently of the live five-line preview.
+    let mut text = stdout;
     if !stderr.trim().is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
@@ -2107,14 +2118,8 @@ async fn shell(
         text = "(no output)".to_string();
     }
 
-    let ui_output = format!("exit code: {code}\n{}", shell_ui_summary(&stdout, &stderr));
-    let _ = tx.send(AgentEvent::ToolOutput {
-        id: id.to_string(),
-        output: ui_output,
-    });
-
     let content = format!("$ {command}\nexit code: {code}\n{text}");
-    if code == 0 {
+    if run.code == Some(0) {
         (ToolStatus::Ok, "Done · exit 0".into(), content)
     } else {
         // Failure is a UI status; retain the output so the model can diagnose it.
@@ -2219,44 +2224,25 @@ async fn start_background_job(id: &str, command: &str, cfg: &Config, tx: &Tx) ->
     }
 }
 
-/// The bounded chat preview of a shell command.
-///
-/// Every line is cut to a readable length and marked with `.....`, and the
-/// omitted tail of a long command is stated explicitly.
+/// A single bounded command line; the approval prompt retains the full script.
 fn shell_preview(command: &str) -> Vec<DiffLine> {
-    let mut diff: Vec<_> = command
-        .lines()
-        .take(SHELL_DIFF_LINES)
-        .map(|l| DiffLine {
-            kind: DiffKind::Context,
-            text: format!("$ {}", truncate_shell_ui_arg(l)),
-            old_line: None,
-            new_line: None,
-        })
-        .collect();
-    if command.lines().count() > SHELL_DIFF_LINES {
-        diff.push(DiffLine {
-            kind: DiffKind::More,
-            text: format!(
-                "{SHELL_UI_CUT_MARKER} preview truncated; review the full command in the approval dialog"
-            ),
-            old_line: None,
-            new_line: None,
-        });
-    }
-    diff
+    vec![DiffLine {
+        kind: DiffKind::Context,
+        text: format!("$ {}", truncate_shell_ui_arg(command)),
+        old_line: None,
+        new_line: None,
+    }]
 }
 
-/// Cut a shell argument for the chat and mark the cut.
-///
-/// The command itself is untouched: the approval dialog and the model still see
-/// it in full, so only the chat preview is shortened.
 fn truncate_shell_ui_arg(text: &str) -> String {
-    if text.chars().count() <= MAX_SHELL_UI_ARG_CHARS {
-        return text.to_string();
+    let safe = crate::process_output::terminal_safe_text(text);
+    let mut chars = safe
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c });
+    let mut cut: String = chars.by_ref().take(MAX_SHELL_UI_ARG_CHARS).collect();
+    if chars.next().is_some() {
+        cut.push_str(SHELL_UI_CUT_MARKER);
     }
-    let mut cut: String = text.chars().take(MAX_SHELL_UI_ARG_CHARS).collect();
-    cut.push_str(SHELL_UI_CUT_MARKER);
     cut
 }
 
@@ -2278,143 +2264,6 @@ fn shell_target(args: &Value) -> String {
         .map(truncate_shell_ui_arg)
         .unwrap_or_else(|| "…".to_string())
         .to_string()
-}
-
-/// Severity of a command output line, guessed from its wording.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ShellLineKind {
-    Error,
-    Warning,
-}
-
-/// Guess whether a line reports an error or a warning.
-///
-/// The heuristic only looks for common English markers. It exists to pull the
-/// important lines out of a noisy output for the user, not to parse anything.
-pub(crate) fn classify_shell_line(line: &str) -> Option<ShellLineKind> {
-    const ERROR_MARKERS: &[&str] = &[
-        "error",
-        "err:",
-        "fatal",
-        "panic",
-        "exception",
-        "traceback",
-        "failed",
-        "failure",
-        "cannot",
-        "unable",
-        "denied",
-        "refused",
-        "not found",
-        "no such file",
-        "timed out",
-        "timeout",
-        "critical",
-        "abort",
-    ];
-    const WARNING_MARKERS: &[&str] = &["warn", "deprecated"];
-
-    let lower = line.to_lowercase();
-    if ERROR_MARKERS.iter().any(|marker| lower.contains(marker)) {
-        Some(ShellLineKind::Error)
-    } else if WARNING_MARKERS.iter().any(|marker| lower.contains(marker)) {
-        Some(ShellLineKind::Warning)
-    } else {
-        None
-    }
-}
-
-/// Build the condensed view of a command output shown to the user.
-///
-/// The user sees the end of every stream plus the error and warning lines that
-/// the condensed view dropped; the model receives the full captured text.
-fn shell_ui_summary(stdout: &str, stderr: &str) -> String {
-    let stdout = shell_output_for_ui(stdout);
-    let stderr = shell_output_for_ui(stderr);
-    let out_lines: Vec<&str> = stdout.lines().collect();
-    let err_lines: Vec<&str> = stderr.lines().collect();
-
-    let mut summary = String::new();
-    let mut shown_out: Vec<usize> = Vec::new();
-    let mut shown_err: Vec<usize> = Vec::new();
-
-    let out_tail = out_lines.len().saturating_sub(MAX_SHELL_UI_TAIL_LINES);
-    if !out_lines.is_empty() {
-        if out_tail > 0 {
-            summary.push_str(&format!(
-                "[stdout: last {MAX_SHELL_UI_TAIL_LINES} of {} lines]\n",
-                out_lines.len()
-            ));
-        }
-        for (idx, line) in out_lines.iter().enumerate().skip(out_tail) {
-            summary.push_str(line);
-            summary.push('\n');
-            shown_out.push(idx);
-        }
-    }
-
-    let err_tail = err_lines.len().saturating_sub(MAX_SHELL_UI_TAIL_LINES);
-    if !err_lines.is_empty() {
-        if err_tail > 0 {
-            summary.push_str(&format!(
-                "[stderr: last {MAX_SHELL_UI_TAIL_LINES} of {} lines]\n",
-                err_lines.len()
-            ));
-        }
-        for (idx, line) in err_lines.iter().enumerate().skip(err_tail) {
-            summary.push_str(line);
-            summary.push('\n');
-            shown_err.push(idx);
-        }
-    }
-
-    // Notable lines from the part that the tail does not show.
-    let mut errors: Vec<&str> = Vec::new();
-    let mut warnings: Vec<&str> = Vec::new();
-    for (idx, line) in out_lines.iter().enumerate() {
-        if shown_out.contains(&idx) {
-            continue;
-        }
-        match classify_shell_line(line) {
-            Some(ShellLineKind::Error) => errors.push(line),
-            Some(ShellLineKind::Warning) => warnings.push(line),
-            None => {}
-        }
-    }
-    for (idx, line) in err_lines.iter().enumerate() {
-        if shown_err.contains(&idx) {
-            continue;
-        }
-        match classify_shell_line(line) {
-            Some(ShellLineKind::Error) => errors.push(line),
-            Some(ShellLineKind::Warning) => warnings.push(line),
-            None => {}
-        }
-    }
-
-    if !errors.is_empty() {
-        let shown = errors.len().min(MAX_SHELL_UI_ERROR_LINES);
-        summary.push_str(&format!("[errors: {shown} of {}]\n", errors.len()));
-        for line in errors.iter().take(MAX_SHELL_UI_ERROR_LINES) {
-            summary.push_str(line);
-            summary.push('\n');
-        }
-    }
-    if !warnings.is_empty() {
-        let shown = warnings.len().min(MAX_SHELL_UI_WARNING_LINES);
-        summary.push_str(&format!("[warnings: {shown} of {}]\n", warnings.len()));
-        for line in warnings.iter().take(MAX_SHELL_UI_WARNING_LINES) {
-            summary.push_str(line);
-            summary.push('\n');
-        }
-    }
-
-    let trimmed = summary.trim_end();
-    if trimmed.is_empty() {
-        "(no output)".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 /// Terminal-safe text with expanded tabs for compact TUI previews.
@@ -2489,57 +2338,43 @@ impl CapturedStream {
     }
 }
 
-/// Read a stream and keep both its beginning and its end.
-///
-/// The head explains how the command started and the tail shows how it ended;
-/// everything in between is dropped once the byte budget is reached.
+#[cfg(test)]
 async fn drain_output(
     mut input: impl AsyncRead + Unpin,
     head_limit: usize,
     tail_limit: usize,
 ) -> std::io::Result<CapturedStream> {
-    let mut head: Vec<u8> = Vec::new();
-    let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_limit);
-    let mut total = 0usize;
+    let mut capture = shell_stream::Capture::new(head_limit, tail_limit);
     let mut buf = [0; 8192];
     loop {
         let n = input.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        total += n;
-        let chunk = &buf[..n];
-        let head_room = head_limit.saturating_sub(head.len());
-        let take = head_room.min(chunk.len());
-        head.extend_from_slice(&chunk[..take]);
-        let remaining = &chunk[take..];
-        if tail_limit > 0 && !remaining.is_empty() {
-            if remaining.len() >= tail_limit {
-                tail.clear();
-                tail.extend(&remaining[remaining.len() - tail_limit..]);
-            } else {
-                let discard = (tail.len() + remaining.len()).saturating_sub(tail_limit);
-                tail.drain(..discard);
-                tail.extend(remaining);
-            }
-        }
+        capture.push(&buf[..n]);
     }
-    Ok(CapturedStream {
-        head,
-        tail: tail.into_iter().collect(),
-        total,
-    })
+    Ok(capture.finish())
 }
 
 /// The result of one shell command: its exit code and both captured streams.
 #[derive(Debug)]
 struct ShellRun {
-    code: i32,
+    code: Option<i32>,
     stdout: CapturedStream,
     stderr: CapturedStream,
 }
 
+#[cfg(test)]
 async fn shell_output(command: &str, root: &Path, deadline: Duration) -> Result<ShellRun> {
+    shell_output_streaming(command, root, deadline, None).await
+}
+
+async fn shell_output_streaming(
+    command: &str,
+    root: &Path,
+    deadline: Duration,
+    updates: Option<watch::Sender<String>>,
+) -> Result<ShellRun> {
     let path = shell_path(executable_dir().as_deref(), std::env::var_os("PATH"));
     let spawn = |program: &str, args: Vec<String>| {
         let mut command = Command::new(program);
@@ -2588,15 +2423,14 @@ async fn shell_output(command: &str, root: &Path, deadline: Duration) -> Result<
         .ok_or_else(|| anyhow!("missing stderr pipe"))?;
     let result = tokio::time::timeout(deadline, async {
         tokio::try_join!(
-            drain_output(stdout, SHELL_STREAM_HEAD_BYTES, SHELL_STREAM_TAIL_BYTES),
-            drain_output(stderr, SHELL_STREAM_HEAD_BYTES, SHELL_STREAM_TAIL_BYTES),
+            shell_stream::drain(stdout, stderr, updates),
             child.inner().wait()
         )
     })
     .await;
     match result {
-        Ok(Ok((stdout, stderr, status))) => Ok(ShellRun {
-            code: status.code().unwrap_or(-1),
+        Ok(Ok(((stdout, stderr), status))) => Ok(ShellRun {
+            code: status.code(),
             stdout,
             stderr,
         }),

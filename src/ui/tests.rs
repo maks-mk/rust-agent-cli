@@ -318,6 +318,7 @@ fn shell_preview_is_not_duplicated_and_states_are_explicit() {
         (ToolStatus::Ok, "done", OK),
         (ToolStatus::Failed, "failed", ERR),
         (ToolStatus::Denied, "denied", WARN),
+        (ToolStatus::Cancelled, "cancelled", WARN),
     ] {
         let mut app = app();
         app.entries = vec![Entry::Tool(ToolEntry {
@@ -340,7 +341,11 @@ fn shell_preview_is_not_duplicated_and_states_are_explicit() {
         assert_text_style(&buffer, "Shell", WARN, BACKGROUND);
         assert_text_style(&buffer, &format!("[{state}]"), color, BACKGROUND);
         assert_text_style(&buffer, "$ echo unique-command", MUTED, BACKGROUND);
-        assert!(screen.contains("shell-output-marker"), "{screen}");
+        assert_eq!(
+            screen.contains("shell-output-marker"),
+            matches!(status, ToolStatus::Running | ToolStatus::Waiting),
+            "{screen}"
+        );
         assert_text_style(&buffer, "result-marker", color, BACKGROUND);
     }
 }
@@ -360,125 +365,63 @@ fn shell_preview_rows(output: &str, width: usize) -> Vec<String> {
 }
 
 #[test]
-fn shell_preview_preserves_short_output_and_exit_code() {
-    for output in ["exit code: 0\nhello\nworld", "exit code: 7\n(no output)"] {
-        let rows = shell_preview_rows(output, 80);
-        assert_eq!(rows.len(), output.lines().count());
-        for (row, original) in rows.iter().zip(output.lines()) {
-            assert!(row.ends_with(original), "{rows:?}");
-        }
-        assert!(!rows.join("\n").contains("output truncated"));
-    }
-    let eight = format!("exit code: 0\n{}", ["line"; 8].join("\n"));
-    assert_eq!(shell_preview_rows(&eight, 80).len(), 9);
-    assert!(!shell_preview_rows(&eight, 80)
-        .join("\n")
-        .contains("truncated"));
-    let nine = format!("{eight}\nlast");
-    let rows = shell_preview_rows(&nine, 80);
-    assert_eq!(rows.len(), 9);
-    assert!(rows.join("\n").contains("last"));
-    assert_eq!(rows.join("\n").matches("output truncated").count(), 1);
-}
-
-#[test]
-fn shell_preview_bounds_a_single_json_line_and_keeps_both_ends() {
-    let output = format!("exit code: 0\n{{\"payload\":\"{}\"}}", "x".repeat(60_000));
-    for width in [24, 40, 80, 2000] {
-        let rows = shell_preview_rows(&output, width);
-        let preview = rows.join("\n");
-        assert!(rows.len() <= 4, "{rows:?}"); // status, at most two body rows, marker
-        assert!(preview.chars().count() <= MAX_SHELL_PREVIEW_CHARS);
-        assert!(preview.contains("exit code: 0"));
-        assert!(preview.contains("{\"payload\":\""), "{preview}");
-        assert!(preview.contains("\"}"), "{preview}");
-        assert_eq!(preview.matches("output truncated").count(), 1);
-    }
-}
-
-#[test]
-fn shell_preview_bounds_unicode_and_multiple_long_lines_at_any_width() {
-    let body = (0..16)
-        .map(|i| format!("line-{i}: {} END", "я中😀e\u{301}\t".repeat(700)))
+fn shell_preview_shows_only_last_five_physical_rows_at_any_width() {
+    let output = (0..20)
+        .map(|i| format!("line-{i} {}", "я中😀e\u{301}".repeat(800)))
         .collect::<Vec<_>>()
         .join("\n");
-    let output = format!("exit code: -1\n{body}");
-    assert!(shell_preview_rows(&output, 0).is_empty());
     for width in [1, 2, 5, 6, 7, 12, 25, 80, 2000] {
         let rows = shell_preview_rows(&output, width);
-        let preview = rows.join("\n");
-        assert!(rows.len() <= MAX_SHELL_PREVIEW_ROWS + 1, "width {width}");
-        assert!(
-            preview.chars().count() <= MAX_SHELL_PREVIEW_CHARS,
-            "width {width}"
-        );
-        assert!(!preview.contains('\u{fffd}'));
+        assert_eq!(rows.len(), 5);
+        assert!(!rows.join("\n").contains('\u{fffd}'));
         if width >= 25 {
-            assert!(preview.contains("exit code: -1"));
-            assert!(preview.contains("END"), "width {width}: {preview}");
-            assert_eq!(preview.matches("output truncated").count(), 1);
+            assert!(rows[0].contains("line-15"));
+            assert!(rows[4].contains("line-19"));
         }
     }
+    assert!(shell_preview_rows("", 80).is_empty());
+    assert!(shell_preview_rows(&output, 0).is_empty());
+    assert_eq!(shell_preview_rows("one\ntwo", 80).len(), 2);
 }
 
 #[test]
-fn shell_preview_prioritizes_diagnostics_then_tail_in_original_order() {
-    let tail = (0..10)
-        .map(|i| format!("stdout-{i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let output = format!(
-        "exit code: 7\n[stdout: last 10 of 200 lines]\n{tail}\n\
-         [stderr: last 1 of 100 lines]\nstderr-tail\n\
-         [errors: 1 of 1]\nerror: early failure\n\
-         [warnings: 1 of 1]\nwarning: early diagnostic"
-    );
-    let rows = shell_preview_rows(&output, 80);
-    let preview = rows.join("\n");
-    assert_eq!(rows.len(), 9);
-    assert!(!preview.contains("stdout-0"));
-    assert!(!preview.contains("[stdout:"));
-    assert!(!preview.contains("[stderr:"));
-    assert!(!preview.contains("[errors:"));
-    assert!(!preview.contains("[warnings:"));
-    let positions: Vec<_> = [
-        "stdout-9",
-        "stderr-tail",
-        "error: early failure",
-        "warning: early diagnostic",
-    ]
-    .iter()
-    .map(|text| {
-        preview
-            .find(text)
-            .unwrap_or_else(|| panic!("missing {text}: {preview}"))
-    })
-    .collect();
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert_eq!(preview.matches("output truncated").count(), 1);
-}
-
-#[test]
-fn shell_preview_limits_background_results_without_requiring_an_exit_code() {
-    let started = "job: bg-1\npid: 123\nlog: .rust-agent/bg-1.log";
-    let rows = shell_preview_rows(started, 80);
-    assert_eq!(rows.len(), 3);
-    assert!(!rows.join("\n").contains("output truncated"));
-    let output = format!(
-        "background job bg-1\nstate: running\npid: 123\ncommand: server\n\
-         log: .rust-agent/bg-1.log\nstarted: today\n--- log tail ---\n\
-         error: connection refused\n{}\nlast-log-line",
-        (0..20)
-            .map(|i| format!("log-{i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let rows = shell_preview_rows(&output, 80);
-    let preview = rows.join("\n");
-    assert_eq!(rows.len(), 8);
-    assert!(preview.contains("error: connection refused"));
-    assert!(preview.contains("last-log-line"));
-    assert_eq!(preview.matches("output truncated").count(), 1);
+fn shell_command_and_status_never_wrap_and_completion_collapses() {
+    let app = app();
+    for status in [
+        ToolStatus::Running,
+        ToolStatus::Ok,
+        ToolStatus::Failed,
+        ToolStatus::Denied,
+        ToolStatus::Cancelled,
+    ] {
+        let tool = Entry::Tool(ToolEntry {
+            id: "compact".into(),
+            label: "Shell".into(),
+            target: format!("echo {}\nsecond command", "я中😀".repeat(200)),
+            status,
+            diff: vec![],
+            result: Some("Done · exit 7".into()),
+            output: Some("1\n2\n3\n4\n5\n6\n7".into()),
+        });
+        for width in [1, 2, 8, 20, 40, 100] {
+            let rows = entry_lines(&app, &tool, false, "*", width, false);
+            assert_eq!(
+                rows.len(),
+                if status == ToolStatus::Running { 7 } else { 2 }
+            );
+            assert!(rows.iter().all(|line| line.width() <= width));
+            if width >= 40 {
+                let text = rows
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("exit 7"));
+                assert_eq!(text.matches("echo").count(), 1);
+                assert!(!text.contains("second command"));
+            }
+        }
+    }
 }
 
 #[test]
@@ -490,7 +433,7 @@ fn shell_preview_reflows_on_resize_without_changing_tool_data() {
             id: "shell".into(),
             label: "Shell".into(),
             target: "echo".into(),
-            status: ToolStatus::Ok,
+            status: ToolStatus::Running,
             diff: vec![],
             result: None,
             output: Some(output.clone()),
@@ -545,9 +488,9 @@ fn shell_preview_bounds_failure_messages_but_not_other_tools() {
         })];
         let rows = build_chat_lines(&app, 80);
         if label == "Shell" {
-            assert!(rows.len() <= MAX_SHELL_PREVIEW_ROWS + 1);
+            assert!(rows.len() <= 7);
         } else {
-            assert!(rows.len() > MAX_SHELL_PREVIEW_ROWS + 1);
+            assert!(rows.len() > 7);
         }
     }
 }

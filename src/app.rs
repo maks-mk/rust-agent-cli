@@ -310,6 +310,16 @@ pub struct ChatUsage {
 }
 
 impl ChatUsage {
+    fn restore(&mut self, has_history: bool) {
+        self.finish_turn();
+        // Older sessions may have messages but no recorded usage. New reports
+        // cannot make the cost of those earlier requests known retroactively.
+        if has_history && !self.has_usage {
+            self.incomplete = true;
+            self.cache_incomplete = true;
+        }
+    }
+
     fn start_request(&mut self) {
         self.finish_turn();
         self.pending = true;
@@ -432,6 +442,7 @@ pub struct App {
     cancelling: bool,
     pub pending: Option<Pending>,
     pending_queue: VecDeque<Pending>,
+    shell_streams: Vec<(String, tokio::sync::watch::Receiver<String>)>,
     pub slash: Option<SlashMenu>,
     pub session_menu: Option<SessionMenu>,
     pub model_menu: Option<ModelMenu>,
@@ -472,7 +483,7 @@ impl App {
         cfg.reasoning_effort = effort_levels.get(effort_index).cloned().flatten();
         session.reasoning_effort = cfg.reasoning_effort.clone();
         session.workspace = cfg.root.to_string_lossy().into_owned();
-        session.token_usage.finish_turn();
+        session.token_usage.restore(!session.history.is_empty());
         let token_usage = session.token_usage.clone();
         let context_tokens = session
             .context_tokens
@@ -522,6 +533,7 @@ impl App {
             cancelling: false,
             pending: None,
             pending_queue: VecDeque::new(),
+            shell_streams: Vec::new(),
             slash: None,
             session_menu: None,
             model_menu: None,
@@ -1078,7 +1090,7 @@ impl App {
             self.session.title
         )));
         self.token_usage = self.session.token_usage.clone();
-        self.token_usage.finish_turn();
+        self.token_usage.restore(!self.history.is_empty());
         self.context_tokens = self
             .session
             .context_tokens
@@ -1393,10 +1405,16 @@ impl App {
     }
 
     fn fail_open_tools(&mut self, why: &str) {
+        self.poll_shell_output();
+        self.shell_streams.clear();
         for (index, e) in self.entries.iter_mut().enumerate() {
             if let Entry::Tool(t) = e {
                 if matches!(t.status, ToolStatus::Running | ToolStatus::Waiting) {
-                    t.status = ToolStatus::Failed;
+                    t.status = if t.label == "Shell" && why == "Interrupted" {
+                        ToolStatus::Cancelled
+                    } else {
+                        ToolStatus::Failed
+                    };
                     t.result = Some(why.to_string());
                     self.rendered.invalidate(index);
                 }
@@ -1404,11 +1422,19 @@ impl App {
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
+    pub async fn shutdown(
+        &mut self,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    ) -> Result<()> {
         self.model_menu = None;
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
+        }
+        // UsageReport and ToolBatch can emit their final events while the
+        // aborted task is dropped. Apply them before saving the session.
+        while let Ok(event) = rx.try_recv() {
+            self.on_agent(event);
         }
         self.mcp.lock().await.shutdown().await;
         self.token_usage.finish_turn();
@@ -1472,6 +1498,34 @@ impl App {
         self.running
             && (self.completion_text == Some(index)
                 || (self.completion_text.is_none() && self.completion_reasoning == Some(index)))
+    }
+
+    pub(crate) fn has_shell_streams(&self) -> bool {
+        !self.shell_streams.is_empty()
+    }
+
+    /// Consume at most one bounded snapshot per command per frame.
+    pub(crate) fn poll_shell_output(&mut self) -> bool {
+        let mut changed = false;
+        for (id, updates) in &mut self.shell_streams {
+            if !updates.has_changed().unwrap_or(true) {
+                continue;
+            }
+            let snapshot = updates.borrow_and_update();
+            if let Some((index, Entry::Tool(tool))) = self
+                .entries
+                .iter_mut()
+                .enumerate()
+                .rfind(|(_, entry)| matches!(entry, Entry::Tool(t) if &t.id == id))
+            {
+                if tool.output.as_ref() != Some(&*snapshot) {
+                    tool.output = Some(snapshot.clone());
+                    self.rendered.invalidate(index);
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
@@ -1545,6 +1599,16 @@ impl App {
                     t.output = Some(output);
                 }
             }
+            AgentEvent::ShellStream { id, updates } => {
+                if let Some(tool) = self.tool_mut(&id) {
+                    if tool.label == "Shell"
+                        && matches!(tool.status, ToolStatus::Running | ToolStatus::Waiting)
+                    {
+                        tool.status = ToolStatus::Running;
+                        self.shell_streams.push((id, updates));
+                    }
+                }
+            }
             AgentEvent::McpApproval { prompt, reply } => {
                 let pending = Pending {
                     id: String::new(),
@@ -1585,6 +1649,13 @@ impl App {
                 status,
                 summary,
             } => {
+                if let Some(index) = self.shell_streams.iter().position(|(key, _)| key == &id) {
+                    let (_, updates) = self.shell_streams.swap_remove(index);
+                    let output = updates.borrow().clone();
+                    if let Some(t) = self.tool_mut(&id) {
+                        t.output = Some(output);
+                    }
+                }
                 if let Some(t) = self.tool_mut(&id) {
                     let repaint = t.status == ToolStatus::Running
                         && (t.label == "Shell" || t.label.starts_with("MCP "));

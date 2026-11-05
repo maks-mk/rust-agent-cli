@@ -57,7 +57,7 @@ pub async fn start(cfg: agent::Config) -> Result<()> {
     }
     .await;
     restore_terminal();
-    let saved = app.shutdown().await;
+    let saved = app.shutdown(&mut rx).await;
     result.and(saved)
 }
 
@@ -87,6 +87,8 @@ async fn run(
     let mut last_frame = Instant::now() - Duration::from_millis(34);
     let mut next_spin = Instant::now() + Duration::from_millis(80);
     let mut log = frame_log();
+    let mut shell_tick = tokio::time::interval(agent::shell_stream::UPDATE_INTERVAL);
+    shell_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let working = app.running || app.rendered.has_running_tool();
         tokio::select! {
@@ -127,6 +129,9 @@ async fn run(
                 app.on_agent(msg);
                 while let Ok(msg) = rx.try_recv() { app.on_agent(msg); }
                 dirty = true;
+            },
+            _ = shell_tick.tick(), if app.has_shell_streams() => {
+                dirty |= app.poll_shell_output();
             },
             _ = app.poll_models(), if app.models_loading() => {
                 dirty = true;
