@@ -271,6 +271,90 @@ fn windows_workspace_paths_match_verbatim_unc_and_case_without_accepting_sibling
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_workspace_short_names_keep_missing_paths_and_reject_links() {
+    fn short_path(path: &Path) -> PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, capacity: u32) -> u32;
+        }
+
+        let long: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `long` is NUL-terminated; a null output requests its capacity.
+        let capacity = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(capacity > 0, "{}", std::io::Error::last_os_error());
+        let mut short = vec![0; capacity as usize];
+        // SAFETY: both pointers remain valid and the output has `capacity` units.
+        let len = unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), capacity) };
+        assert!(
+            len > 0 && len < capacity,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        PathBuf::from(OsString::from_wide(&short[..len as usize]))
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("rust-agent-long-workspace-")
+        .tempdir()
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let short = short_path(dir.path());
+    std::fs::write(root.join("note.txt"), "content").unwrap();
+    // Volumes without 8.3 names return the long path; CI's NTFS volume also
+    // exercises aliases in both the workspace name and its parent directories.
+    for workspace in [&root, &short] {
+        for base in [&root, &short] {
+            for relative in ["note.txt", "nested/new.txt"] {
+                let path = base.join(relative);
+                assert_eq!(
+                    resolve(workspace, path.to_str().unwrap()).unwrap(),
+                    root.join(relative)
+                );
+                assert_eq!(
+                    resolve(workspace, &path.to_string_lossy().replace('\\', "/")).unwrap(),
+                    root.join(relative)
+                );
+            }
+        }
+    }
+    let outside = tempfile::Builder::new()
+        .prefix("rust-agent-long-outside-")
+        .tempdir()
+        .unwrap();
+    assert!(resolve(
+        &root,
+        short_path(outside.path()).join("new.txt").to_str().unwrap()
+    )
+    .is_err());
+    assert!(resolve(&root, short.join("../outside.txt").to_str().unwrap()).is_err());
+
+    // Junctions need no symlink privilege. Point back to the workspace itself
+    // to catch implementations that canonicalize past a link and hide it.
+    let junction = std::process::Command::new("cmd.exe")
+        .args(["/D", "/C", "mklink", "/J", "back", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        junction.status.success(),
+        "{}",
+        String::from_utf8_lossy(&junction.stderr)
+    );
+    for relative in ["back/note.txt", "back/new.txt"] {
+        assert!(
+            resolve(&root, short.join(relative).to_str().unwrap())
+                .unwrap_err()
+                .contains("symbolic links"),
+            "{relative}"
+        );
+    }
+    std::fs::remove_dir(root.join("back")).unwrap();
+}
+
 #[test]
 fn ui_diff_folds_distant_unchanged_ranges_and_counts_only_real_changes() {
     let old = (1..=30).map(|i| format!("keep {i}\n")).collect::<String>();

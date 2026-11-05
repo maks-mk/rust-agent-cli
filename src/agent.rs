@@ -2486,7 +2486,10 @@ fn resolve(root: &Path, p: &str) -> std::result::Result<PathBuf, String> {
         }
     }
 
-    let relative = workspace_relative_path(&out, &root_real).ok_or_else(|| {
+    let relative = workspace_relative_path(&out, &root_real);
+    #[cfg(windows)]
+    let relative = relative.or_else(|| windows_workspace_alias_relative_path(&out, &root_real));
+    let relative = relative.ok_or_else(|| {
         format!("path is outside the workspace: {}. Use a path relative to the Workspace directory, e.g. 'src/main.rs'.", p.display())
     })?;
     // Rebuild from the canonical root so plain Windows drive/UNC paths and
@@ -2571,6 +2574,30 @@ fn workspace_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
         }
         Some(components.collect())
     }
+}
+
+#[cfg(windows)]
+fn windows_workspace_alias_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    // Windows can spell an existing workspace prefix with 8.3 names (for
+    // example RUNNER~1). Resolve only that prefix, leaving the rest untouched
+    // so missing targets and the symlink checks in `resolve` still work.
+    let mut prefix = PathBuf::new();
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        prefix.push(component.as_os_str());
+        if !prefix.is_absolute() {
+            continue;
+        }
+        let real = std::fs::canonicalize(&prefix).ok()?;
+        if workspace_relative_path(&real, root)
+            .is_some_and(|relative| relative.as_os_str().is_empty())
+        {
+            // Stop at the first matching prefix. A link deeper inside the
+            // workspace must remain in the relative path and be rejected.
+            return Some(components.collect());
+        }
+    }
+    None
 }
 
 fn workspace_path_label(root: &Path, path: &Path) -> String {
